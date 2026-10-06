@@ -11,8 +11,9 @@ QT_BEGIN_NAMESPACE
 namespace QFFmpeg {
 
 VideoRenderer::VideoRenderer(const PlaybackEngineObjectID &id, const TimeController &tc,
-                             QVideoSink *sink, const VideoTransformation &transform)
-    : Renderer(id, tc), m_sink(sink), m_transform(transform)
+                             QVideoSink *sink, const VideoTransformation &transform,
+                             QVideoFrameFormat::StereoMode streamStereoMode)
+    : Renderer(id, tc), m_sink(sink), m_transform(transform), m_stereoMode(streamStereoMode)
 {
 }
 
@@ -74,9 +75,14 @@ VideoRenderer::RenderingResult VideoRenderer::renderInternal(Frame frame)
     format.setMirrored(m_transform.mirroredHorizontallyAfterRotation);
     // A stream's frame packing arrangement SEI is sent with its keyframes, and holds until another
     // one replaces it (H.264 D.2.26, frame_packing_arrangement_repetition_period 1)
-    if (const auto stereoMode = buffer->stereoMode())
-        m_stereoMode = *stereoMode;
+    const auto stereo = buffer->stereo();
+    if (stereo) {
+        m_stereoMode = stereo->mode;
+        m_stereoFlags = stereo->flags;
+    }
     format.setStereoMode(m_stereoMode);
+    format.setStereoFlags(m_stereoFlags);
+    format.setStereoView(stereo ? stereo->view : QVideoFrameFormat::StereoView::Packed);
     QVideoFrame videoFrame = QVideoFramePrivate::createFrame(std::move(buffer), format);
     videoFrame.setStartTime(frame.startTime().get());
     videoFrame.setEndTime(frame.endTime().get());

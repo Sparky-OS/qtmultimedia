@@ -120,6 +120,25 @@ static bool colorTransferSupportsHdr(const AVStream *stream)
             || colorTransfer == QVideoFrameFormat::ColorTransfer_STD_B67;
 }
 
+QVideoFrameFormat::StereoMode MediaDataHolder::stereoMode() const
+{
+    const int streamIndex = m_currentAVStreamIndex[QPlatformMediaPlayer::VideoStream];
+    if (streamIndex < 0)
+        return QVideoFrameFormat::StereoMode::None;
+
+    // RFC 9559, 5.1.4.1.28.3: StereoMode 10 and 12; FFmpeg's names for them
+    const AVDictionaryEntry *tag =
+            av_dict_get(m_context->streams[streamIndex]->metadata, "stereo_mode", nullptr, 0);
+    if (!tag)
+        return QVideoFrameFormat::StereoMode::None;
+    const QByteArrayView mode(tag->value);
+    if (mode == "anaglyph_cyan_red")
+        return QVideoFrameFormat::StereoMode::AnaglyphCyanRed;
+    if (mode == "anaglyph_green_magenta")
+        return QVideoFrameFormat::StereoMode::AnaglyphGreenMagenta;
+    return QVideoFrameFormat::StereoMode::None;
+}
+
 VideoTransformation MediaDataHolder::transformation() const
 {
     // TODO: Add QMediaMetaData::Mirrored and take from it and QMediaMetaData::Orientation:

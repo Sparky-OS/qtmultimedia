@@ -343,23 +343,36 @@ void tst_QVideoFrameFormat::frameRate()
 
 void tst_QVideoFrameFormat::stereoMode()
 {
+    using Mode = QVideoFrameFormat::StereoMode;
     QVideoFrameFormat format(QSize(16, 16), QVideoFrameFormat::Format_XRGB8888);
-    QCOMPARE(format.stereoMode(), QVideoFrameFormat::StereoMode_None);
+    QCOMPARE(format.stereoMode(), Mode::None);
+    QCOMPARE(format.stereoFlags(), QVideoFrameFormat::StereoFlags());
+    QCOMPARE(format.stereoView(), QVideoFrameFormat::StereoView::Packed);
 
     const QVideoFrameFormat mono = format;
-    const auto modes = { QVideoFrameFormat::StereoMode_SideBySide,
-                         QVideoFrameFormat::StereoMode_SideBySideRightFirst,
-                         QVideoFrameFormat::StereoMode_TopBottom,
-                         QVideoFrameFormat::StereoMode_TopBottomRightFirst };
+    const auto modes = { Mode::SideBySide, Mode::TopBottom, Mode::SideBySideQuincunx,
+                         Mode::RowInterleaved, Mode::ColumnInterleaved, Mode::Checkerboard,
+                         Mode::FrameSequence, Mode::AnaglyphCyanRed, Mode::AnaglyphGreenMagenta };
     for (const auto mode : modes) {
         format.setStereoMode(mode);
         QCOMPARE(format.stereoMode(), mode);
         QVERIFY(format != mono);
-        QCOMPARE(mono.stereoMode(), QVideoFrameFormat::StereoMode_None);
+        QCOMPARE(mono.stereoMode(), Mode::None);
     }
-
-    format.setStereoMode(QVideoFrameFormat::StereoMode_None);
+    format.setStereoMode(Mode::None);
     QVERIFY(format == mono);
+
+    format.setStereoFlags(QVideoFrameFormat::StereoFlag::RightEyeFirst);
+    QVERIFY(format.stereoFlags().testFlag(QVideoFrameFormat::StereoFlag::RightEyeFirst));
+    QVERIFY(format != mono);
+    format.setStereoFlags({});
+    format.setStereoView(QVideoFrameFormat::StereoView::Right);
+    QCOMPARE(format.stereoView(), QVideoFrameFormat::StereoView::Right);
+    QVERIFY(format != mono);
+    format.setStereoView(QVideoFrameFormat::StereoView::Packed);
+    QVERIFY(format == mono);
+
+    QCOMPARE(int(Mode::None), 0);
 }
 
 void tst_QVideoFrameFormat::compare()

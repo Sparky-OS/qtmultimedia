@@ -74,6 +74,10 @@ public:
 
     VideoTransformation transformation() const;
 
+    // What the video stream says about stereoscopic 3D without a frame to say it: the anaglyph
+    // values of Matroska's StereoMode, which FFmpeg only gives as the stream's stereo_mode tag
+    QVideoFrameFormat::StereoMode stereoMode() const;
+
     AVFormatContext *avContext();
 
     int currentStreamIndex(QPlatformMediaPlayer::TrackType trackType) const;

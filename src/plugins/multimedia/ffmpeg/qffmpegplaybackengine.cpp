@@ -205,7 +205,7 @@ PlaybackEngine::createRenderer(QPlatformMediaPlayer::TrackType trackType)
     switch (trackType) {
     case QPlatformMediaPlayer::VideoStream:
         return m_videoSink ? createPlaybackEngineObject<VideoRenderer>(
-                       m_timeController, m_videoSink, m_media.transformation())
+                       m_timeController, m_videoSink, m_media.transformation(), m_media.stereoMode())
                            : RendererPtr{ {}, {} };
     case QPlatformMediaPlayer::AudioStream:
         return m_audioOutput || m_audioBufferOutput

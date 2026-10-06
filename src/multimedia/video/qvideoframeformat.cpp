@@ -38,7 +38,8 @@ public:
         if (pixelFormat == other.pixelFormat && scanLineDirection == other.scanLineDirection
             && frameSize == other.frameSize && viewport == other.viewport
             && frameRatesEqual(frameRate, other.frameRate) && colorSpace == other.colorSpace
-            && transformation == other.transformation && stereoMode == other.stereoMode)
+            && transformation == other.transformation && stereoMode == other.stereoMode
+            && stereoFlags == other.stereoFlags && stereoView == other.stereoView)
             return true;
 
         return false;
@@ -59,7 +60,9 @@ public:
     float frameRate = 0.0;
     float maxLuminance = -1.;
     VideoTransformation transformation;
-    QVideoFrameFormat::StereoMode stereoMode = QVideoFrameFormat::StereoMode_None;
+    QVideoFrameFormat::StereoMode stereoMode = QVideoFrameFormat::StereoMode::None;
+    QVideoFrameFormat::StereoFlags stereoFlags;
+    QVideoFrameFormat::StereoView stereoView = QVideoFrameFormat::StereoView::Packed;
 };
 
 QT_DEFINE_QESDP_SPECIALIZATION_DTOR(QVideoFrameFormatPrivate);
@@ -655,24 +658,69 @@ void QVideoFrameFormat::setColorRange(ColorRange range)
 /*!
     \enum QVideoFrameFormat::StereoMode
 
-    Enumerates how the frames of a stereoscopic 3D video hold their two views. The views are
-    packed into every frame, each at one half of the frame's width or height, and the frame is
-    not split by the format: the mode only says where the views are.
+    Enumerates how the frames of a stereoscopic 3D video hold its two views. The names and
+    numbers of the packings follow the frame packing arrangement types of H.264 (Rec. ITU-T H.264,
+    Table D-8) and H.265 (Rec. ITU-T H.265, Table D.8), which Matroska's StereoMode (RFC 9559,
+    section 5.1.4.1.28.3, values 0 to 14) and FFmpeg's AVStereo3D share. Which eye comes first
+    is given by stereoFlags().
 
-    \value StereoMode_None
-    The video is not stereoscopic, or its packing is not one of the following.
+    \value None
+    The video is not stereoscopic (type 6, two-dimensional, and StereoMode 0).
 
-    \value StereoMode_SideBySide
-    The left eye's view is on the left half of the frame and the right eye's view on the right half.
+    \value SideBySide
+    The views are next to each other, the first on the left (type 3; StereoMode 1 and 11).
 
-    \value StereoMode_SideBySideRightFirst
-    The right eye's view is on the left half of the frame and the left eye's view on the right half.
+    \value TopBottom
+    The views are on top of each other, the first on top (type 4; StereoMode 3 and 2).
 
-    \value StereoMode_TopBottom
-    The left eye's view is on the top half of the frame and the right eye's view on the bottom half.
+    \value SideBySideQuincunx
+    Side by side with quincunx sampling (type 3 with quincunx_sampling_flag set).
 
-    \value StereoMode_TopBottomRightFirst
-    The right eye's view is on the top half of the frame and the left eye's view on the bottom half.
+    \value RowInterleaved
+    The views are in alternate rows, the first view in the first row (type 2; StereoMode 7 and 6).
+
+    \value ColumnInterleaved
+    The views are in alternate columns, the first view in the first column (type 1; StereoMode 9 and 8).
+
+    \value Checkerboard
+    The views alternate in a checkerboard pattern, the first view at the top left pixel
+    (type 0; StereoMode 5 and 4).
+
+    \value FrameSequence
+    The frames are the views in turn (temporal interleaving, type 5; StereoMode 13 and 14, both
+    eyes in one block). Which view a frame holds is given by stereoView() when the stream says so;
+    otherwise the first frame holds the first view and the frames alternate.
+
+    \value AnaglyphCyanRed
+    Both views in one picture, as red and cyan anaglyph (StereoMode 10).
+
+    \value AnaglyphGreenMagenta
+    Both views in one picture, as green and magenta anaglyph (StereoMode 12).
+
+    \since 6.12
+*/
+
+/*!
+    \enum QVideoFrameFormat::StereoFlag
+
+    \value RightEyeFirst
+    The first view of the packing is the right eye's (content_interpretation_type 2 of the frame
+    packing arrangement SEI, the "right eye first" StereoMode values, AV_STEREO3D_FLAG_INVERT).
+
+    \since 6.12
+*/
+
+/*!
+    \enum QVideoFrameFormat::StereoView
+
+    \value Packed
+    The frame holds the two views in the packing of stereoMode(), or does not say.
+
+    \value Left
+    The frame holds the left view only (a frame of a FrameSequence).
+
+    \value Right
+    The frame holds the right view only (a frame of a FrameSequence).
 
     \since 6.12
 */
@@ -680,7 +728,7 @@ void QVideoFrameFormat::setColorRange(ColorRange range)
 /*!
     Returns how the frames of the stream hold the two views of a stereoscopic 3D video.
 
-    The default value is \l StereoMode_None.
+    The default value is \l StereoMode::None.
 
     \since 6.12
 */
@@ -698,6 +746,48 @@ void QVideoFrameFormat::setStereoMode(StereoMode mode)
 {
     detach();
     d->stereoMode = mode;
+}
+
+/*!
+    Returns the flags of the stereoscopic 3D packing, which eye comes first.
+
+    \since 6.12
+*/
+QVideoFrameFormat::StereoFlags QVideoFrameFormat::stereoFlags() const
+{
+    return d->stereoFlags;
+}
+
+/*!
+    Sets the flags of the stereoscopic 3D packing to \a flags.
+
+    \since 6.12
+*/
+void QVideoFrameFormat::setStereoFlags(StereoFlags flags)
+{
+    detach();
+    d->stereoFlags = flags;
+}
+
+/*!
+    Returns which view the frame holds when the video is a StereoMode::FrameSequence.
+
+    \since 6.12
+*/
+QVideoFrameFormat::StereoView QVideoFrameFormat::stereoView() const
+{
+    return d->stereoView;
+}
+
+/*!
+    Sets which view the frame holds to \a view.
+
+    \since 6.12
+*/
+void QVideoFrameFormat::setStereoView(StereoView view)
+{
+    detach();
+    d->stereoView = view;
 }
 
 /*!
@@ -1004,7 +1094,7 @@ QDebug operator<<(QDebug dbg, const QVideoFrameFormat &f)
         << "\n    mirrored=" << f.isMirrored()
         << "\n    range=" << f.colorRange()
         << "\n    colorTransfer=" << f.colorTransfer()
-        << "\n    stereoMode=" << f.stereoMode();
+        << "\n    stereoMode=" << f.stereoMode() << f.stereoFlags() << f.stereoView();
 
     return dbg;
 }
