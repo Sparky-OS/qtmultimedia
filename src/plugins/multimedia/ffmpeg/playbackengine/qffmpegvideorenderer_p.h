@@ -16,6 +16,7 @@
 
 #include <QtFFmpegMediaPluginImpl/private/qffmpegrenderer_p.h>
 
+#include <QtMultimedia/qvideoframeformat.h>
 #include <QtMultimedia/private/qvideotransformation_p.h>
 #include <QtCore/qpointer.h>
 
@@ -30,7 +31,8 @@ class VideoRenderer : public Renderer
     Q_OBJECT
 public:
     VideoRenderer(const PlaybackEngineObjectID &id, const TimeController &tc, QVideoSink *sink,
-                  const VideoTransformation &transform);
+                  const VideoTransformation &transform,
+                  QVideoFrameFormat::StereoMode streamStereoMode);
 
     void setOutput(QVideoSink *sink, bool cleanPrevSink = false);
 
@@ -40,6 +42,8 @@ protected:
 private:
     QPointer<QVideoSink> m_sink;
     VideoTransformation m_transform;
+    QVideoFrameFormat::StereoMode m_stereoMode;
+    QVideoFrameFormat::StereoFlags m_stereoFlags;
 };
 
 } // namespace QFFmpeg

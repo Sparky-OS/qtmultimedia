@@ -125,6 +125,36 @@ public:
     };
     Q_ENUM(ColorRange)
 
+    enum class StereoMode
+    {
+        None,
+        SideBySide,
+        TopBottom,
+        SideBySideQuincunx,
+        RowInterleaved,
+        ColumnInterleaved,
+        Checkerboard,
+        FrameSequence,
+        AnaglyphCyanRed,
+        AnaglyphGreenMagenta
+    };
+    Q_ENUM(StereoMode)
+
+    enum class StereoFlag
+    {
+        RightEyeFirst = 0x1
+    };
+    Q_DECLARE_FLAGS(StereoFlags, StereoFlag)
+    Q_FLAG(StereoFlags)
+
+    enum class StereoView
+    {
+        Packed,
+        Left,
+        Right
+    };
+    Q_ENUM(StereoView)
+
     QVideoFrameFormat();
     QVideoFrameFormat(const QSize &size, PixelFormat pixelFormat);
     QVideoFrameFormat(const QVideoFrameFormat &format);
@@ -187,6 +217,15 @@ public:
     ColorRange colorRange() const;
     void setColorRange(ColorRange range);
 
+    StereoMode stereoMode() const;
+    void setStereoMode(StereoMode mode);
+
+    StereoFlags stereoFlags() const;
+    void setStereoFlags(StereoFlags flags);
+
+    StereoView stereoView() const;
+    void setStereoView(StereoView view);
+
     bool isMirrored() const;
     void setMirrored(bool mirrored);
 
@@ -208,6 +247,8 @@ public:
 private:
     QExplicitlySharedDataPointer<QVideoFrameFormatPrivate> d;
 };
+
+Q_DECLARE_OPERATORS_FOR_FLAGS(QVideoFrameFormat::StereoFlags)
 
 Q_DECLARE_SHARED(QVideoFrameFormat)
 

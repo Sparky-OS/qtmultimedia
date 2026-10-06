@@ -12,6 +12,7 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 #include <libavutil/hdr_dynamic_metadata.h>
 #include <libavutil/mastering_display_metadata.h>
+#include <libavutil/stereo3d.h>
 }
 
 QT_BEGIN_NAMESPACE
@@ -27,11 +28,58 @@ static bool isFrameFlipped(const AVFrame& frame) {
     return false;
 }
 
+// The packing of a stereoscopic 3D frame, from the side data FFmpeg fills with the frame
+// packing arrangement SEI (H.264 D.2.26, H.265 D.2.16) and, for the frames of a stream that
+// carries it, with the StereoMode of the Matroska track (RFC 9559, 5.1.4.1.28.3).
+// Nothing is returned for a frame without it, which says nothing about the stream.
+static std::optional<QFFmpeg::VideoStereo> stereoFromSideData(const AVFrame &frame)
+{
+    const AVFrameSideData *sideData = av_frame_get_side_data(&frame, AV_FRAME_DATA_STEREO3D);
+    if (!sideData || sideData->size < sizeof(AVStereo3D))
+        return std::nullopt;
+
+    const auto *stereo = reinterpret_cast<const AVStereo3D *>(sideData->data);
+    QFFmpeg::VideoStereo result;
+    switch (stereo->type) {
+    case AV_STEREO3D_SIDEBYSIDE:
+        result.mode = QVideoFrameFormat::StereoMode::SideBySide;
+        break;
+    case AV_STEREO3D_TOPBOTTOM:
+        result.mode = QVideoFrameFormat::StereoMode::TopBottom;
+        break;
+    case AV_STEREO3D_SIDEBYSIDE_QUINCUNX:
+        result.mode = QVideoFrameFormat::StereoMode::SideBySideQuincunx;
+        break;
+    case AV_STEREO3D_LINES:
+        result.mode = QVideoFrameFormat::StereoMode::RowInterleaved;
+        break;
+    case AV_STEREO3D_COLUMNS:
+        result.mode = QVideoFrameFormat::StereoMode::ColumnInterleaved;
+        break;
+    case AV_STEREO3D_CHECKERBOARD:
+        result.mode = QVideoFrameFormat::StereoMode::Checkerboard;
+        break;
+    case AV_STEREO3D_FRAMESEQUENCE:
+        result.mode = QVideoFrameFormat::StereoMode::FrameSequence;
+        break;
+    default:
+        break;
+    }
+    if (stereo->flags & AV_STEREO3D_FLAG_INVERT)
+        result.flags |= QVideoFrameFormat::StereoFlag::RightEyeFirst;
+    if (stereo->view == AV_STEREO3D_VIEW_LEFT)
+        result.view = QVideoFrameFormat::StereoView::Left;
+    else if (stereo->view == AV_STEREO3D_VIEW_RIGHT)
+        result.view = QVideoFrameFormat::StereoView::Right;
+    return result;
+}
+
 QFFmpegVideoBuffer::QFFmpegVideoBuffer(AVFrameUPtr frame, AVRational pixelAspectRatio)
     : QHwVideoBuffer(QVideoFrame::NoHandle),
       m_frame(frame.get()),
       m_size(qCalculateFrameSize({ frame->width, frame->height },
-                                 { pixelAspectRatio.num, pixelAspectRatio.den }))
+                                 { pixelAspectRatio.num, pixelAspectRatio.den })),
+      m_stereo(stereoFromSideData(*frame))
 {
     if (frame->hw_frames_ctx) {
         m_hwFrame = std::move(frame);
