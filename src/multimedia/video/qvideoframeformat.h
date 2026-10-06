@@ -125,6 +125,16 @@ public:
     };
     Q_ENUM(ColorRange)
 
+    enum StereoMode
+    {
+        StereoMode_None,
+        StereoMode_SideBySide,
+        StereoMode_SideBySideRightFirst,
+        StereoMode_TopBottom,
+        StereoMode_TopBottomRightFirst
+    };
+    Q_ENUM(StereoMode)
+
     QVideoFrameFormat();
     QVideoFrameFormat(const QSize &size, PixelFormat pixelFormat);
     QVideoFrameFormat(const QVideoFrameFormat &format);
@@ -186,6 +196,9 @@ public:
 
     ColorRange colorRange() const;
     void setColorRange(ColorRange range);
+
+    StereoMode stereoMode() const;
+    void setStereoMode(StereoMode mode);
 
     bool isMirrored() const;
     void setMirrored(bool mirrored);

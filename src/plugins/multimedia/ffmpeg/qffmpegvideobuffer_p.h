@@ -21,6 +21,8 @@
 #include <QtFFmpegMediaPluginImpl/private/qffmpeg_p.h>
 #include <QtFFmpegMediaPluginImpl/private/qffmpeghwaccel_p.h>
 
+#include <optional>
+
 QT_BEGIN_NAMESPACE
 
 class QFFmpegVideoBuffer : public QHwVideoBuffer
@@ -56,6 +58,9 @@ public:
 
     float maxNits();
 
+    // The frame's own packing of a stereoscopic 3D video, if it carries one
+    std::optional<QVideoFrameFormat::StereoMode> stereoMode() const { return m_stereoMode; }
+
 private:
     // The result texture converter must be accessed from the rhi's thread
     QFFmpeg::TextureConverter &ensureTextureConverter(QRhi &rhi);
@@ -68,6 +73,7 @@ private:
     AVFrameUPtr m_hwFrame;
     AVFrameUPtr m_swFrame;
     QSize m_size;
+    std::optional<QVideoFrameFormat::StereoMode> m_stereoMode;
     QVideoFrame::MapMode m_mode = QVideoFrame::NotMapped;
 };
 

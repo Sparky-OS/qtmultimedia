@@ -72,6 +72,11 @@ VideoRenderer::RenderingResult VideoRenderer::renderInternal(Frame frame)
     format.setMaxLuminance(buffer->maxNits());
     format.setRotation(m_transform.rotation);
     format.setMirrored(m_transform.mirroredHorizontallyAfterRotation);
+    // A stream's frame packing arrangement SEI is sent with its keyframes, and holds until another
+    // one replaces it (H.264 D.2.26, frame_packing_arrangement_repetition_period 1)
+    if (const auto stereoMode = buffer->stereoMode())
+        m_stereoMode = *stereoMode;
+    format.setStereoMode(m_stereoMode);
     QVideoFrame videoFrame = QVideoFramePrivate::createFrame(std::move(buffer), format);
     videoFrame.setStartTime(frame.startTime().get());
     videoFrame.setEndTime(frame.endTime().get());

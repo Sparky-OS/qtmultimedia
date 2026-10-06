@@ -40,6 +40,7 @@ private slots:
     void frameRate();
     void colorSpaceEnum_data();
     void colorSpaceEnum ();
+    void stereoMode();
     void compare();
     void copy();
     void assign();
@@ -338,6 +339,27 @@ void tst_QVideoFrameFormat::frameRate()
     format.setStreamFrameRate(frameRate);
 
     QCOMPARE(format.streamFrameRate(), frameRate);
+}
+
+void tst_QVideoFrameFormat::stereoMode()
+{
+    QVideoFrameFormat format(QSize(16, 16), QVideoFrameFormat::Format_XRGB8888);
+    QCOMPARE(format.stereoMode(), QVideoFrameFormat::StereoMode_None);
+
+    const QVideoFrameFormat mono = format;
+    const auto modes = { QVideoFrameFormat::StereoMode_SideBySide,
+                         QVideoFrameFormat::StereoMode_SideBySideRightFirst,
+                         QVideoFrameFormat::StereoMode_TopBottom,
+                         QVideoFrameFormat::StereoMode_TopBottomRightFirst };
+    for (const auto mode : modes) {
+        format.setStereoMode(mode);
+        QCOMPARE(format.stereoMode(), mode);
+        QVERIFY(format != mono);
+        QCOMPARE(mono.stereoMode(), QVideoFrameFormat::StereoMode_None);
+    }
+
+    format.setStereoMode(QVideoFrameFormat::StereoMode_None);
+    QVERIFY(format == mono);
 }
 
 void tst_QVideoFrameFormat::compare()

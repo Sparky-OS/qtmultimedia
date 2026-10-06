@@ -38,7 +38,7 @@ public:
         if (pixelFormat == other.pixelFormat && scanLineDirection == other.scanLineDirection
             && frameSize == other.frameSize && viewport == other.viewport
             && frameRatesEqual(frameRate, other.frameRate) && colorSpace == other.colorSpace
-            && transformation == other.transformation)
+            && transformation == other.transformation && stereoMode == other.stereoMode)
             return true;
 
         return false;
@@ -59,6 +59,7 @@ public:
     float frameRate = 0.0;
     float maxLuminance = -1.;
     VideoTransformation transformation;
+    QVideoFrameFormat::StereoMode stereoMode = QVideoFrameFormat::StereoMode_None;
 };
 
 QT_DEFINE_QESDP_SPECIALIZATION_DTOR(QVideoFrameFormatPrivate);
@@ -652,6 +653,54 @@ void QVideoFrameFormat::setColorRange(ColorRange range)
 }
 
 /*!
+    \enum QVideoFrameFormat::StereoMode
+
+    Enumerates how the frames of a stereoscopic 3D video hold their two views. The views are
+    packed into every frame, each at one half of the frame's width or height, and the frame is
+    not split by the format: the mode only says where the views are.
+
+    \value StereoMode_None
+    The video is not stereoscopic, or its packing is not one of the following.
+
+    \value StereoMode_SideBySide
+    The left eye's view is on the left half of the frame and the right eye's view on the right half.
+
+    \value StereoMode_SideBySideRightFirst
+    The right eye's view is on the left half of the frame and the left eye's view on the right half.
+
+    \value StereoMode_TopBottom
+    The left eye's view is on the top half of the frame and the right eye's view on the bottom half.
+
+    \value StereoMode_TopBottomRightFirst
+    The right eye's view is on the top half of the frame and the left eye's view on the bottom half.
+
+    \since 6.12
+*/
+
+/*!
+    Returns how the frames of the stream hold the two views of a stereoscopic 3D video.
+
+    The default value is \l StereoMode_None.
+
+    \since 6.12
+*/
+QVideoFrameFormat::StereoMode QVideoFrameFormat::stereoMode() const
+{
+    return d->stereoMode;
+}
+
+/*!
+    Sets how the frames of the stream hold the two views of a stereoscopic 3D video to \a mode.
+
+    \since 6.12
+*/
+void QVideoFrameFormat::setStereoMode(StereoMode mode)
+{
+    detach();
+    d->stereoMode = mode;
+}
+
+/*!
     Returns \c true if the surface is mirrored around its vertical axis.
 
     Transformations of \c QVideoFrameFormat, specifically,
@@ -954,7 +1003,8 @@ QDebug operator<<(QDebug dbg, const QVideoFrameFormat &f)
         << "\n    frameRate=" << f.streamFrameRate()
         << "\n    mirrored=" << f.isMirrored()
         << "\n    range=" << f.colorRange()
-        << "\n    colorTransfer=" << f.colorTransfer();
+        << "\n    colorTransfer=" << f.colorTransfer()
+        << "\n    stereoMode=" << f.stereoMode();
 
     return dbg;
 }

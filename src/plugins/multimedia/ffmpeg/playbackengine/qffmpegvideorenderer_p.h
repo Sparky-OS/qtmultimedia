@@ -16,6 +16,7 @@
 
 #include <QtFFmpegMediaPluginImpl/private/qffmpegrenderer_p.h>
 
+#include <QtMultimedia/qvideoframeformat.h>
 #include <QtMultimedia/private/qvideotransformation_p.h>
 #include <QtCore/qpointer.h>
 
@@ -40,6 +41,7 @@ protected:
 private:
     QPointer<QVideoSink> m_sink;
     VideoTransformation m_transform;
+    QVideoFrameFormat::StereoMode m_stereoMode = QVideoFrameFormat::StereoMode_None;
 };
 
 } // namespace QFFmpeg

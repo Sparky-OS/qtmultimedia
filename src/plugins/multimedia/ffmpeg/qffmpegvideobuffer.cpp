@@ -12,6 +12,7 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 #include <libavutil/hdr_dynamic_metadata.h>
 #include <libavutil/mastering_display_metadata.h>
+#include <libavutil/stereo3d.h>
 }
 
 QT_BEGIN_NAMESPACE
@@ -27,11 +28,39 @@ static bool isFrameFlipped(const AVFrame& frame) {
     return false;
 }
 
+// The packing of a stereoscopic 3D frame, from the side data FFmpeg fills with the frame
+// packing arrangement SEI (H.264 D.2.26, H.265 D.2.16) and, for the frames of a stream that
+// carries it, with the StereoMode of the Matroska track (RFC 9559, 5.1.4.1.28.3).
+// Nothing is returned for a frame without it, which says nothing about the stream.
+static std::optional<QVideoFrameFormat::StereoMode> stereoModeFromSideData(const AVFrame &frame)
+{
+    const AVFrameSideData *sideData = av_frame_get_side_data(&frame, AV_FRAME_DATA_STEREO3D);
+    if (!sideData || sideData->size < sizeof(AVStereo3D))
+        return std::nullopt;
+
+    const auto *stereo = reinterpret_cast<const AVStereo3D *>(sideData->data);
+    if (stereo->view != AV_STEREO3D_VIEW_PACKED)
+        return QVideoFrameFormat::StereoMode_None;
+
+    const bool rightFirst = stereo->flags & AV_STEREO3D_FLAG_INVERT;
+    switch (stereo->type) {
+    case AV_STEREO3D_SIDEBYSIDE:
+        return rightFirst ? QVideoFrameFormat::StereoMode_SideBySideRightFirst
+                          : QVideoFrameFormat::StereoMode_SideBySide;
+    case AV_STEREO3D_TOPBOTTOM:
+        return rightFirst ? QVideoFrameFormat::StereoMode_TopBottomRightFirst
+                          : QVideoFrameFormat::StereoMode_TopBottom;
+    default:
+        return QVideoFrameFormat::StereoMode_None;
+    }
+}
+
 QFFmpegVideoBuffer::QFFmpegVideoBuffer(AVFrameUPtr frame, AVRational pixelAspectRatio)
     : QHwVideoBuffer(QVideoFrame::NoHandle),
       m_frame(frame.get()),
       m_size(qCalculateFrameSize({ frame->width, frame->height },
-                                 { pixelAspectRatio.num, pixelAspectRatio.den }))
+                                 { pixelAspectRatio.num, pixelAspectRatio.den })),
+      m_stereoMode(stereoModeFromSideData(*frame))
 {
     if (frame->hw_frames_ctx) {
         m_hwFrame = std::move(frame);
