@@ -42,7 +42,10 @@ class QFFmpegVideoBuffer : public QHwVideoBuffer
 public:
     using AVFrameUPtr = QFFmpeg::AVFrameUPtr;
 
-    QFFmpegVideoBuffer(AVFrameUPtr frame, AVRational pixelAspectRatio = { 1, 1 });
+    // stereoMode is the packing the stream has had until this frame (the frame packing SEI comes
+    // with keyframes only), for a frame that does not carry it
+    QFFmpegVideoBuffer(AVFrameUPtr frame, AVRational pixelAspectRatio = { 1, 1 },
+                       QVideoFrameFormat::StereoMode stereoMode = QVideoFrameFormat::StereoMode::None);
     ~QFFmpegVideoBuffer() override;
 
     MapData map(QVideoFrame::MapMode mode) override;
@@ -73,6 +76,10 @@ public:
     // The frame's own packing of a stereoscopic 3D video, if it carries one
     std::optional<QFFmpeg::VideoStereo> stereo() const { return m_stereo; }
 
+    // The pixel aspect ratio left to the consumer: 1:1, but for a stereoscopic 3D frame with views
+    // side by side or on top of each other, which is kept at the size it is stored in
+    QSize pixelAspectRatio() const { return m_pixelAspectRatio; }
+
 private:
     // The result texture converter must be accessed from the rhi's thread
     QFFmpeg::TextureConverter &ensureTextureConverter(QRhi &rhi);
@@ -86,6 +93,7 @@ private:
     AVFrameUPtr m_swFrame;
     QSize m_size;
     std::optional<QFFmpeg::VideoStereo> m_stereo;
+    QSize m_pixelAspectRatio = QSize(1, 1);
     QVideoFrame::MapMode m_mode = QVideoFrame::NotMapped;
 };
 

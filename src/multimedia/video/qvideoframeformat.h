@@ -230,6 +230,9 @@ public:
     StereoView stereoView() const;
     void setStereoView(StereoView view);
 
+    QSize pixelAspectRatio() const;
+    void setPixelAspectRatio(QSize ratio);
+
     bool isMirrored() const;
     void setMirrored(bool mirrored);
 

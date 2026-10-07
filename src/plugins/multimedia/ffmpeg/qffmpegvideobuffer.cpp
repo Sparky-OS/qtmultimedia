@@ -74,13 +74,27 @@ static std::optional<QFFmpeg::VideoStereo> stereoFromSideData(const AVFrame &fra
     return result;
 }
 
-QFFmpegVideoBuffer::QFFmpegVideoBuffer(AVFrameUPtr frame, AVRational pixelAspectRatio)
+QFFmpegVideoBuffer::QFFmpegVideoBuffer(AVFrameUPtr frame, AVRational pixelAspectRatio,
+                                       QVideoFrameFormat::StereoMode stereoMode)
     : QHwVideoBuffer(QVideoFrame::NoHandle),
       m_frame(frame.get()),
       m_size(qCalculateFrameSize({ frame->width, frame->height },
                                  { pixelAspectRatio.num, pixelAspectRatio.den })),
       m_stereo(stereoFromSideData(*frame))
 {
+    // Two views next to each other, or on top of each other, are not scaled to the shape of the
+    // pixels as one picture: the frame stays as it is stored, and the consumer, which takes the views
+    // apart, restores each from the stored samples (QVideoFrameFormat::pixelAspectRatio)
+    const auto mode = m_stereo ? m_stereo->mode : stereoMode;
+    if ((mode == QVideoFrameFormat::StereoMode::SideBySide
+         || mode == QVideoFrameFormat::StereoMode::SideBySideQuincunx
+         || mode == QVideoFrameFormat::StereoMode::TopBottom)
+        && pixelAspectRatio.num > 0 && pixelAspectRatio.den > 0
+        && pixelAspectRatio.num != pixelAspectRatio.den) {
+        m_size = QSize(frame->width, frame->height);
+        m_pixelAspectRatio = QSize(pixelAspectRatio.num, pixelAspectRatio.den);
+    }
+
     if (frame->hw_frames_ctx) {
         m_hwFrame = std::move(frame);
         m_pixelFormat = toQtPixelFormat(HWAccel::format(m_hwFrame.get()));

@@ -178,11 +178,14 @@ QImage extractView(const QImage &frameImage, const Packing &packing, int index, 
             ? frameImage
             : frameImage.convertToFormat(QImage::Format_RGBA32FPx4_Premultiplied);
     const QSize frameSize = src.size();
-    const QSize target = viewSize(packing, frameSize);
+    // where the views are to end up: the size of a view of the frame as it is shown
+    const QSize shown = packing.displaySize.isValid() ? packing.displaySize : frameSize;
+    const QSize target = viewSize(packing, shown);
     if (src.isNull() || target.isEmpty())
         return {};
 
-    const bool full = isFullSize(packing, frameSize);
+    const bool full = isFullSize(packing, shown);
+    Q_UNUSED(full);
     const int first = index; // 0 or 1: the view that is first or second in the packing
 
     // The samples of the view in the frame, per axis
@@ -201,10 +204,12 @@ QImage extractView(const QImage &frameImage, const Packing &packing, int index, 
     case Mode::SideBySideQuincunx:
         sx0 = first * (frameSize.width() / 2);
         ax.source = frameSize.width() / 2;
+        ay.source = frameSize.height();
         break;
     case Mode::TopBottom:
         sy0 = first * (frameSize.height() / 2);
         ay.source = frameSize.height() / 2;
+        ax.source = frameSize.width();
         break;
     case Mode::RowInterleaved:
         rowStep = 2;
@@ -229,16 +234,13 @@ QImage extractView(const QImage &frameImage, const Packing &packing, int index, 
     switch (packing.mode) {
     case Mode::SideBySide:
     case Mode::SideBySideQuincunx:
-        ax.stride = 1;
-        ax.phase = 0.5;
-        if (!full)
-            setSqueezed(ax);
+        // the samples of a view are as far apart as the view is larger than they are many
+        setSqueezed(ax);
+        setSqueezed(ay);
         break;
     case Mode::TopBottom:
-        ay.stride = 1;
-        ay.phase = 0.5;
-        if (!full)
-            setSqueezed(ay);
+        setSqueezed(ax);
+        setSqueezed(ay);
         break;
     case Mode::RowInterleaved:
         ay.stride = 2;

@@ -36,6 +36,10 @@ struct Packing
     QVideoFrameFormat::StereoMode mode = QVideoFrameFormat::StereoMode::None;
     bool rightEyeFirst = false;
     enum class Size { ByShape, Half, Full } size = Size::ByShape;
+    // The size the frame is shown at, when it is not the size it is stored in (a frame the
+    // backend left unscaled to the shape of its pixels, QVideoFrameFormat::pixelAspectRatio()):
+    // the views are then restored from the stored samples to the size of a view of this
+    QSize displaySize;
 };
 
 // True for the packings whose views can be taken apart (the anaglyphs hold both in the colors)
