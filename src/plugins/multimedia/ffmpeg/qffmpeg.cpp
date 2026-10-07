@@ -11,6 +11,7 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 #include <libavutil/samplefmt.h>
 #include <libavutil/error.h>
+#include <libavutil/opt.h>
 
 #ifdef Q_OS_DARWIN
 #include <libavutil/hwcontext_videotoolbox.h>
@@ -132,6 +133,58 @@ const AVPacketSideData *streamSideData(const AVStream *stream, AVPacketSideDataT
 #endif
 }
 
+static AudioQuality readAudioQuality()
+{
+    // What Qt does without any of the variables is the default of each; a build for hi-fi
+    // playback only changes these
+    AudioQuality q;
+    const QByteArray resampler = qgetenv("QT_FFMPEG_AUDIO_RESAMPLER");
+    if (!resampler.isEmpty())
+        q.soxr = resampler == "soxr";
+    bool ok = false;
+    const int precision = qEnvironmentVariableIntValue("QT_FFMPEG_AUDIO_RESAMPLER_PRECISION", &ok);
+    if (ok && precision >= 15 && precision <= 33)
+        q.soxrPrecision = precision;
+    const QByteArray sampleFormat = qgetenv("QT_FFMPEG_AUDIO_SINK_SAMPLE_FORMAT");
+    if (sampleFormat == "float")
+        q.sinkSampleFormat = QAudioFormat::Float;
+    else if (sampleFormat == "int32")
+        q.sinkSampleFormat = QAudioFormat::Int32;
+    const int minRate = qEnvironmentVariableIntValue("QT_FFMPEG_AUDIO_SINK_MIN_RATE", &ok);
+    if (ok && minRate > 0)
+        q.sinkMinSampleRate = minRate;
+    return q;
+}
+
+const AudioQuality &audioQuality()
+{
+    static const AudioQuality quality = readAudioQuality();
+    return quality;
+}
+
+QAudioFormat audioSinkFormat(const QAudioFormat &streamFormat, const QAudioDevice &device)
+{
+    const AudioQuality &q = audioQuality();
+    QAudioFormat format = streamFormat;
+    const auto supported = device.supportedSampleFormats();
+    // a stream of 8 or 16 bits is held exactly by 32 bit samples; a deeper one is left as it is
+    if (q.sinkSampleFormat != QAudioFormat::Unknown
+        && (format.sampleFormat() == QAudioFormat::UInt8 || format.sampleFormat() == QAudioFormat::Int16)
+        && supported.contains(q.sinkSampleFormat)) {
+        format.setSampleFormat(q.sinkSampleFormat);
+    }
+    if (q.sinkMinSampleRate > 0 && format.sampleRate() < q.sinkMinSampleRate
+        && device.minimumSampleRate() <= q.sinkMinSampleRate
+        && device.maximumSampleRate() >= q.sinkMinSampleRate) {
+        format.setSampleRate(q.sinkMinSampleRate);
+    }
+    qCDebug(qLcFFmpegUtils) << "audio sink format" << format << "for the stream's" << streamFormat
+                            << "device" << device.description() << "preferred" << device.preferredFormat()
+                            << "rates" << device.minimumSampleRate() << device.maximumSampleRate()
+                            << "sample formats" << supported;
+    return format;
+}
+
 SwrContextUPtr createResampleContext(const AVAudioFormat &inputFormat,
                                      const AVAudioFormat &outputFormat)
 {
@@ -168,12 +221,36 @@ SwrContextUPtr createResampleContext(const AVAudioFormat &inputFormat,
 
 #endif
 
+    const AudioQuality &quality = audioQuality();
+    if (resampler && quality.soxr) {
+        // libswresample's SoX resampler at its high precisions
+        av_opt_set(resampler, "resampler", "soxr", 0);
+        av_opt_set_int(resampler, "precision", quality.soxrPrecision, 0);
+        if (quality.soxrPrecision > 20)
+            av_opt_set_int(resampler, "cheby", 1, 0);
+    }
+
     auto error = QFFmpeg::AVError{
         swr_init(resampler),
     };
+    if (error != QFFmpeg::AVError::Success && quality.soxr) {
+        qCWarning(qLcFFmpegUtils) << "The SoX resampler is not there, resampling with the default engine:" << error;
+        av_opt_set(resampler, "resampler", "swr", 0);
+        error = QFFmpeg::AVError{ swr_init(resampler) };
+    }
     if (error != QFFmpeg::AVError::Success) {
         qCWarning(qLcFFmpegUtils) << "Failed to initialize audio resampler:" << error;
         return nullptr;
+    }
+    if (qLcFFmpegUtils().isDebugEnabled()) {
+        // what the context really has
+        uint8_t *engine = nullptr;
+        int64_t precision = 0;
+        av_opt_get(resampler, "resampler", 0, &engine);
+        av_opt_get_int(resampler, "precision", 0, &precision);
+        qCDebug(qLcFFmpegUtils) << "audio resampler" << (engine ? reinterpret_cast<const char *>(engine) : "?")
+                                << "precision" << precision << "bits";
+        av_free(engine);
     }
     return SwrContextUPtr(resampler);
 }

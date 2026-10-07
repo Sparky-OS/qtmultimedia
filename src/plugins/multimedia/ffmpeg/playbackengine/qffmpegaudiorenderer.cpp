@@ -298,7 +298,7 @@ void AudioRenderer::updateOutputs(const Frame &frame)
         return;
 
     if (!m_sinkFormat.isValid()) {
-        m_sinkFormat = audioFormatFromFrame(frame);
+        m_sinkFormat = QFFmpeg::audioSinkFormat(audioFormatFromFrame(frame), m_output->device());
         m_sinkFormat.setChannelConfig(m_output->device().channelConfiguration());
     }
 
