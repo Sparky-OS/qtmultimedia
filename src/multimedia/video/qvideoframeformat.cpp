@@ -39,7 +39,8 @@ public:
             && frameSize == other.frameSize && viewport == other.viewport
             && frameRatesEqual(frameRate, other.frameRate) && colorSpace == other.colorSpace
             && transformation == other.transformation && stereoMode == other.stereoMode
-            && stereoFlags == other.stereoFlags && stereoView == other.stereoView)
+            && stereoFlags == other.stereoFlags && stereoView == other.stereoView
+            && pixelAspectRatio == other.pixelAspectRatio)
             return true;
 
         return false;
@@ -63,6 +64,7 @@ public:
     QVideoFrameFormat::StereoMode stereoMode = QVideoFrameFormat::StereoMode::None;
     QVideoFrameFormat::StereoFlags stereoFlags;
     QVideoFrameFormat::StereoView stereoView = QVideoFrameFormat::StereoView::Packed;
+    QSize pixelAspectRatio = QSize(1, 1);
 };
 
 QT_DEFINE_QESDP_SPECIALIZATION_DTOR(QVideoFrameFormatPrivate);
@@ -800,6 +802,37 @@ void QVideoFrameFormat::setStereoView(StereoView view)
 {
     detach();
     d->stereoView = view;
+}
+
+/*!
+    Returns the pixel aspect ratio that the samples of the frame are to be shown with, as
+    a width (numerator) and a height (denominator), when the backend has left it to the
+    consumer.
+
+    A backend scales a frame to the shape of its pixels (the sample aspect ratio of the stream)
+    before it hands the frame over, and the ratio is then 1:1 as it is by default. Only for a
+    stereoscopic 3D frame whose views the consumer is to take apart (stereoMode() is
+    \l StereoMode::SideBySide, \l StereoMode::SideBySideQuincunx or \l StereoMode::TopBottom)
+    does a backend leave the frame at the size it is stored in and say the ratio here: the
+    consumer then restores each view from the stored samples, with the filter of its choice,
+    instead of taking the views from samples that were scaled as one picture.
+
+    \since 6.12
+*/
+QSize QVideoFrameFormat::pixelAspectRatio() const
+{
+    return d->pixelAspectRatio;
+}
+
+/*!
+    Sets the pixel aspect ratio of the frame to \a ratio, a width and a height.
+
+    \since 6.12
+*/
+void QVideoFrameFormat::setPixelAspectRatio(QSize ratio)
+{
+    detach();
+    d->pixelAspectRatio = ratio;
 }
 
 /*!

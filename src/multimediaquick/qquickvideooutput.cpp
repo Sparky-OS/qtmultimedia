@@ -1149,7 +1149,13 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
     result.layerWanted = false;
     if (frame.isValid()) {
         const QVideoFrameFormat format = frame.surfaceFormat();
-        const QSize frameSize = frame.size();
+        const QSize storedSize = frame.size();
+        // a stereo frame the backend left at its stored size is shown at the shape of its pixels
+        const QSize par = format.pixelAspectRatio();
+        const QSize frameSize = par.width() > 0 && par.height() > 0 && par.width() != par.height()
+                ? qCalculateFrameSize(storedSize, { par.width(), par.height() })
+                : storedSize;
+        displaySize = frameSize;
         packing.mode = format.stereoMode();
         packing.rightEyeFirst = format.stereoFlags().testFlag(QVideoFrameFormat::StereoFlag::RightEyeFirst);
         if (st.input != StereoAutomatic) {
@@ -1158,6 +1164,8 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
                    && frameSize.width() >= 2.5 * frameSize.height()) {
             packing = { StereoMode::SideBySide, false, Size::Full };
         }
+        if (storedSize != frameSize)
+            packing.displaySize = frameSize;
         twoViews = hasTwoViews(packing.mode) && !frameSize.isEmpty();
         result.video = twoViews;
         result.packing = packing.mode == StereoMode::None ? StereoNone
@@ -1262,9 +1270,9 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
                 const int index = rightFirst ? 1 - wanted : wanted;
                 QRect rect;
                 displaySize = viewSize(packing, frameSize);
-                if (viewRect(packing, frameSize, index, &rect)) {
-                    result.eyeRect = QRectF(qreal(rect.x()) / frameSize.width(), qreal(rect.y()) / frameSize.height(),
-                                            qreal(rect.width()) / frameSize.width(), qreal(rect.height()) / frameSize.height());
+                if (viewRect(packing, storedSize, index, &rect)) {
+                    result.eyeRect = QRectF(qreal(rect.x()) / storedSize.width(), qreal(rect.y()) / storedSize.height(),
+                                            qreal(rect.width()) / storedSize.width(), qreal(rect.height()) / storedSize.height());
                 } else {
                     // the views are interleaved: taken apart on the CPU, into a frame of their own
                     const int depth = sourceDepth(format.pixelFormat());
