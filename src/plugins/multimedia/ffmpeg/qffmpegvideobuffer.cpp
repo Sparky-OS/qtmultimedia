@@ -339,6 +339,12 @@ QVideoFrameFormat::PixelFormat QFFmpegVideoBuffer::toQtPixelFormat(AVPixelFormat
 
     case AV_PIX_FMT_YUV422P:
         return QVideoFrameFormat::Format_YUV422P;
+    case AV_PIX_FMT_YUV444P:
+        return QVideoFrameFormat::Format_YUV444P;
+    case AV_PIX_FMT_YUV422P16:
+        return QVideoFrameFormat::Format_YUV422P16;
+    case AV_PIX_FMT_YUV444P16:
+        return QVideoFrameFormat::Format_YUV444P16;
     case AV_PIX_FMT_YUV420P:
         return QVideoFrameFormat::Format_YUV420P;
     case AV_PIX_FMT_YUV420P10:
@@ -372,8 +378,18 @@ QVideoFrameFormat::PixelFormat QFFmpegVideoBuffer::toQtPixelFormat(AVPixelFormat
     if (descriptor->flags & AV_PIX_FMT_FLAG_RGB)
         return QVideoFrameFormat::Format_RGBA8888;
 
-    if (descriptor->comp[0].depth > 8)
+    // the chroma keeps its resolution, and the samples their bits
+    const bool fullChroma = descriptor->log2_chroma_w == 0 && descriptor->log2_chroma_h == 0;
+    const bool halfChroma = descriptor->log2_chroma_w == 1 && descriptor->log2_chroma_h == 0;
+    if (descriptor->comp[0].depth > 8) {
+        if (fullChroma)
+            return QVideoFrameFormat::Format_YUV444P16;
+        if (halfChroma)
+            return QVideoFrameFormat::Format_YUV422P16;
         return QVideoFrameFormat::Format_P016;
+    }
+    if (fullChroma)
+        return QVideoFrameFormat::Format_YUV444P;
     return QVideoFrameFormat::Format_YUV420P;
 }
 
@@ -418,6 +434,12 @@ AVPixelFormat QFFmpegVideoBuffer::toAVPixelFormat(QVideoFrameFormat::PixelFormat
         return AV_PIX_FMT_YUV422P;
     case QVideoFrameFormat::Format_YUV420P:
         return AV_PIX_FMT_YUV420P;
+    case QVideoFrameFormat::Format_YUV444P:
+        return AV_PIX_FMT_YUV444P;
+    case QVideoFrameFormat::Format_YUV422P16:
+        return AV_PIX_FMT_YUV422P16;
+    case QVideoFrameFormat::Format_YUV444P16:
+        return AV_PIX_FMT_YUV444P16;
     case QVideoFrameFormat::Format_YUV420P10:
         return AV_PIX_FMT_YUV420P10;
     case QVideoFrameFormat::Format_UYVY:

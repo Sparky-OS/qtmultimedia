@@ -232,6 +232,24 @@ static const TextureDescription descriptions[QVideoFrameFormat::NPixelFormats] =
         { TextureDescription::Red_16, TextureDescription::Red_16, TextureDescription::Red_16 },
         { { 1, 1 }, { 2, 2 }, { 2, 2 } }
     },
+    // Format_YUV444P
+    { 3, 1,
+        [](int stride, int height) { return stride * height * 3; },
+        { TextureDescription::Red_8, TextureDescription::Red_8, TextureDescription::Red_8 },
+        { { 1, 1 }, { 1, 1 }, { 1, 1 } }
+    },
+    // Format_YUV422P16
+    { 3, 2,
+        [](int stride, int height) { return stride * height * 2; },
+        { TextureDescription::Red_16, TextureDescription::Red_16, TextureDescription::Red_16 },
+        { { 1, 1 }, { 2, 1 }, { 2, 1 } }
+    },
+    // Format_YUV444P16
+    { 3, 2,
+        [](int stride, int height) { return stride * height * 3; },
+        { TextureDescription::Red_16, TextureDescription::Red_16, TextureDescription::Red_16 },
+        { { 1, 1 }, { 1, 1 }, { 1, 1 } }
+    },
 };
 
 Q_GLOBAL_STATIC(QList<QRhiTexture::Format>, g_excludedRhiTextureFormats) // for tests only
@@ -375,8 +393,13 @@ QString fragmentShaderFileName(const QVideoFrameFormat &format, QRhi *,
         break;
     case QVideoFrameFormat::Format_YUV420P:
     case QVideoFrameFormat::Format_YUV422P:
+    case QVideoFrameFormat::Format_YUV444P:
     case QVideoFrameFormat::Format_IMC3:
         shaderFile = QStringLiteral("yuv_triplanar");
+        break;
+    case QVideoFrameFormat::Format_YUV422P16:
+    case QVideoFrameFormat::Format_YUV444P16:
+        shaderFile = QStringLiteral("yuv_triplanar_p16");
         break;
     case QVideoFrameFormat::Format_YUV420P10:
         shaderFile = QStringLiteral("yuv_triplanar_p10");
@@ -635,6 +658,9 @@ void updateUniformData(QByteArray *dst, QRhi *rhi, const QVideoFrameFormat &form
     case QVideoFrameFormat::Format_YUV420P:
     case QVideoFrameFormat::Format_YUV420P10:
     case QVideoFrameFormat::Format_YUV422P:
+    case QVideoFrameFormat::Format_YUV444P:
+    case QVideoFrameFormat::Format_YUV422P16:
+    case QVideoFrameFormat::Format_YUV444P16:
     case QVideoFrameFormat::Format_YV12:
     case QVideoFrameFormat::Format_UYVY:
     case QVideoFrameFormat::Format_YUYV:

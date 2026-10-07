@@ -22,6 +22,10 @@
 #endif
 
 #include <rhi/qrhi.h>
+
+extern "C" {
+#include <libavutil/pixdesc.h>
+}
 #include <qloggingcategory.h>
 #include <unordered_set>
 
@@ -237,6 +241,27 @@ static bool isNoConversionFormat(AVPixelFormat f)
     return !needsConversion;
 };
 
+// Whether the frames of hardware decoding hold as many bits per sample as the stream has. A
+// decoder that makes frames of fewer bits (a 10 bit stream decoded to 8 bit frames) would
+// drop the depth of the video for good, so the software decoder is better for it
+static bool hwFramesKeepDepth(AVCodecContext *codecContext, AVPixelFormat hwFormat)
+{
+    const AVPixFmtDescriptor *wanted = av_pix_fmt_desc_get(codecContext->sw_pix_fmt);
+    if (!wanted)
+        return true;
+    AVBufferRef *frames = nullptr;
+    if (avcodec_get_hw_frames_parameters(codecContext, codecContext->hw_device_ctx, hwFormat,
+                                         &frames) < 0 || !frames)
+        return true; // cannot tell
+    const auto *framesContext = reinterpret_cast<const AVHWFramesContext *>(frames->data);
+    const AVPixFmtDescriptor *got = av_pix_fmt_desc_get(framesContext->sw_format);
+    const bool keeps = !got || got->comp[0].depth >= wanted->comp[0].depth;
+    av_buffer_unref(&frames);
+    if (!keeps)
+        qCWarning(qLHWAccel) << "Not decoding in hardware: its frames have fewer bits per sample than the stream";
+    return keeps;
+}
+
 // Used for the AVCodecContext::get_format callback
 AVPixelFormat getFormat(AVCodecContext *codecContext, const AVPixelFormat *fmt)
 {
@@ -285,7 +310,9 @@ AVPixelFormat getFormat(AVCodecContext *codecContext, const AVPixelFormat *fmt)
                 formatAndScore = found;
         }
 
-        const auto format = formatAndScore.value;
+        auto format = formatAndScore.value;
+        if (format && !hwFramesKeepDepth(codecContext, *format))
+            format = std::nullopt;
         if (format) {
             TextureConverter::applyDecoderPreset(*format, *codecContext);
             qCDebug(qLHWAccel) << "Selected format" << *format << "for hw" << device_ctx->type;

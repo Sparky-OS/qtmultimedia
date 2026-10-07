@@ -65,11 +65,15 @@ public:
         Format_Jpeg,
         Format_SamplerRect,
 
-        Format_YUV420P10
+        Format_YUV420P10,
+
+        Format_YUV444P,
+        Format_YUV422P16,
+        Format_YUV444P16
     };
     Q_ENUM(PixelFormat)
 #ifndef Q_QDOC
-    static constexpr int NPixelFormats = Format_YUV420P10 + 1;
+    static constexpr int NPixelFormats = Format_YUV444P16 + 1;
 #endif
 
     enum Direction

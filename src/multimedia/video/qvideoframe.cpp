@@ -502,6 +502,9 @@ bool QVideoFrame::map(QVideoFrame::MapMode mode)
         case QVideoFrameFormat::Format_YUV420P:
         case QVideoFrameFormat::Format_YUV420P10:
         case QVideoFrameFormat::Format_YUV422P:
+        case QVideoFrameFormat::Format_YUV444P:
+        case QVideoFrameFormat::Format_YUV422P16:
+        case QVideoFrameFormat::Format_YUV444P16:
         case QVideoFrameFormat::Format_YV12: {
             // The UV stride is usually half the Y stride and is 32-bit aligned.
             // However it's not always the case, at least on Windows where the
@@ -510,7 +513,11 @@ bool QVideoFrame::map(QVideoFrame::MapMode mode)
             // have a correct stride.
             const int height = this->height();
             const int yStride = d->mapData.bytesPerLine[0];
-            const int uvHeight = pixelFmt == QVideoFrameFormat::Format_YUV422P ? height : height / 2;
+            const bool fullHeightUV = pixelFmt == QVideoFrameFormat::Format_YUV422P
+                    || pixelFmt == QVideoFrameFormat::Format_YUV444P
+                    || pixelFmt == QVideoFrameFormat::Format_YUV422P16
+                    || pixelFmt == QVideoFrameFormat::Format_YUV444P16;
+            const int uvHeight = fullHeightUV ? height : height / 2;
             Q_ASSERT(uvHeight > 0);
             const int uvSize = d->mapData.dataSize[0] - yStride * height;
             const int uvStride = uvSize / 2 / uvHeight;

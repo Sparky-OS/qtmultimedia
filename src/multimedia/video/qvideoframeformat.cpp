@@ -217,6 +217,18 @@ QT_DEFINE_QESDP_SPECIALIZATION_DTOR(QVideoFrameFormatPrivate);
 
     \value Format_YUV420P10
     Similar to YUV420, but uses 16bits per component, 10 of those significant.
+
+    \value Format_YUV444P
+    The frame is stored using an 8 bit per component planar YUV format with the U and V planes at
+    the full resolution of the Y plane (4:4:4).
+
+    \value Format_YUV422P16
+    The frame is stored using a 16 bit per component planar YUV format with the U and V planes at
+    half the horizontal resolution of the Y plane (4:2:2). The samples fill the 16 bits: a video of
+    fewer bits has them in the upper bits.
+
+    \value Format_YUV444P16
+    Like Format_YUV422P16, with the U and V planes at the full resolution of the Y plane (4:4:4).
 */
 
 /*!
@@ -1007,6 +1019,9 @@ QImage::Format QVideoFrameFormat::imageFormatFromPixelFormat(QVideoFrameFormat::
     case QVideoFrameFormat::Format_YUV420P:
     case QVideoFrameFormat::Format_YUV420P10:
     case QVideoFrameFormat::Format_YUV422P:
+    case QVideoFrameFormat::Format_YUV444P:
+    case QVideoFrameFormat::Format_YUV422P16:
+    case QVideoFrameFormat::Format_YUV444P16:
     case QVideoFrameFormat::Format_YV12:
     case QVideoFrameFormat::Format_UYVY:
     case QVideoFrameFormat::Format_YUYV:
@@ -1046,6 +1061,9 @@ QT_MM_MAKE_STRING_RESOLVER(QVideoFrameFormat::PixelFormat, QtMultimediaPrivate::
     (QVideoFrameFormat::Format_YUV420P,                 "YUV420P")
     (QVideoFrameFormat::Format_YUV420P10,               "YUV420P10")
     (QVideoFrameFormat::Format_YUV422P,                 "YUV422P")
+    (QVideoFrameFormat::Format_YUV444P,                 "YUV444P")
+    (QVideoFrameFormat::Format_YUV422P16,               "YUV422P16")
+    (QVideoFrameFormat::Format_YUV444P16,               "YUV444P16")
     (QVideoFrameFormat::Format_YV12,                    "YV12")
     (QVideoFrameFormat::Format_UYVY,                    "UYVY")
     (QVideoFrameFormat::Format_YUYV,                    "YUYV")

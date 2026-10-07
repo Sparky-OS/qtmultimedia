@@ -496,6 +496,12 @@ static VideoFrameConvertFunc qConvertFuncs[QVideoFrameFormat::NPixelFormats] = {
     /* Format_P010 */                   qt_convert_P016_to_ARGB32,
     /* Format_P016 */                   qt_convert_P016_to_ARGB32,
     /* Format_Jpeg */                   nullptr, // Not needed
+    /* Format_SamplerExternalOES */     nullptr,
+    /* Format_SamplerRect */            nullptr,
+    /* Format_YUV420P10 */              nullptr,
+    /* Format_YUV444P */                nullptr, // by the GPU
+    /* Format_YUV422P16 */              nullptr, // by the GPU
+    /* Format_YUV444P16 */              nullptr, // by the GPU
 };
 
 static PixelsCopyFunc qPixelsCopyFunc = qt_copy_pixels_with_mask<uint32_t>;
