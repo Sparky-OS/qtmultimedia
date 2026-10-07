@@ -27,6 +27,7 @@ qt_internal_add_qml_module(MultimediaQuickPrivate
         qquickscreencapture.cpp qquickscreencapture_p.h
         qquicksoundeffect.cpp qquicksoundeffect_p.h
         qquickvideooutput.cpp qquickvideooutput_p.h
+        qquickvideostereo.cpp qquickvideostereo_p.h
         qsgvideonode_p.cpp qsgvideonode_p.h
         qsgvideotexture.cpp qsgvideotexture_p.h
         qtmultimediaquickglobal_p.h

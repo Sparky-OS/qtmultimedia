@@ -109,10 +109,16 @@ static bool updateTextures(QRhi *rhi,
                            std::unique_ptr<QRhiGraphicsPipeline> &graphicsPipeline,
                            std::unique_ptr<QRhiRenderPassDescriptor> &renderPass,
                            QVideoFrame &frame,
-                           const QVideoFrameTexturesUPtr &videoFrameTextures)
+                           const QVideoFrameTexturesUPtr &videoFrameTextures,
+                           bool passThroughTransfer)
 {
     auto format = frame.surfaceFormat();
     auto pixelFormat = format.pixelFormat();
+    // The shaders of PQ and HLG video map it to the SDR range of the output. The code values
+    // are wanted as they are (the matrix of the color space still applies), as for any
+    // other transfer function
+    if (passThroughTransfer)
+        format.setColorTransfer(QVideoFrameFormat::ColorTransfer_Unknown);
 
     auto textureDesc = QVideoTextureHelper::textureDescription(pixelFormat);
 
@@ -249,6 +255,18 @@ QImage qImageFromVideoFrame(const QVideoFrame &frame, bool forceCpu)
 QImage qImageFromVideoFrame(const QVideoFrame &frame, const VideoTransformation &transformation,
                             bool forceCpu)
 {
+    return qImageFromVideoFrame(frame, transformation, QVideoFrameImageDepth::Bits8, forceCpu);
+}
+
+QImage qImageFromVideoFrame(const QVideoFrame &frame, QVideoFrameImageDepth depth)
+{
+    return qImageFromVideoFrame(frame, qNormalizedSurfaceTransformation(frame.surfaceFormat()),
+                                depth, false);
+}
+
+QImage qImageFromVideoFrame(const QVideoFrame &frame, const VideoTransformation &transformation,
+                            QVideoFrameImageDepth depth, bool forceCpu)
+{
 #ifdef Q_OS_DARWIN
     QMacAutoReleasePool releasePool;
 #endif
@@ -315,7 +333,15 @@ QImage qImageFromVideoFrame(const QVideoFrame &frame, const VideoTransformation 
 
     shaderResourceBindings.reset(rhi->newShaderResourceBindings());
 
-    targetTexture.reset(rhi->newTexture(QRhiTexture::RGBA8, frameSize, 1, QRhiTexture::RenderTarget));
+    const bool deep = depth != QVideoFrameImageDepth::Bits8;
+    const QRhiTexture::Format targetFormat = depth == QVideoFrameImageDepth::Float32
+            ? QRhiTexture::RGBA32F
+            : deep ? QRhiTexture::RGBA16F : QRhiTexture::RGBA8;
+    if (deep && !rhi->isTextureFormatSupported(targetFormat)) {
+        qCDebug(qLcVideoFrameConverter) << "No floating point target. Using 8 bits.";
+        return qImageFromVideoFrame(frame, transformation, QVideoFrameImageDepth::Bits8, forceCpu);
+    }
+    targetTexture.reset(rhi->newTexture(targetFormat, frameSize, 1, QRhiTexture::RenderTarget));
     if (!targetTexture->create()) {
         qCDebug(qLcVideoFrameConverter) << "Failed to create target texture. Using CPU conversion.";
         return convertCPU(frame, transformation);
@@ -350,7 +376,7 @@ QImage qImageFromVideoFrame(const QVideoFrame &frame, const VideoTransformation 
     }
 
     if (!updateTextures(rhi, uniformBuffer, textureSampler, shaderResourceBindings,
-                        graphicsPipeline, renderPass, frameTmp, videoFrameTextures)) {
+                        graphicsPipeline, renderPass, frameTmp, videoFrameTextures, deep)) {
         qCDebug(qLcVideoFrameConverter) << "Failed to update textures. Using CPU conversion.";
         return convertCPU(frame, transformation);
     }
@@ -400,9 +426,12 @@ QImage qImageFromVideoFrame(const QVideoFrame &frame, const VideoTransformation 
 
     QByteArray *imageData = new QByteArray(readResult.data);
 
+    const QImage::Format imageFormat = depth == QVideoFrameImageDepth::Float32
+            ? QImage::Format_RGBA32FPx4_Premultiplied
+            : deep ? QImage::Format_RGBA16FPx4_Premultiplied : QImage::Format_RGBA8888_Premultiplied;
     return QImage(reinterpret_cast<const uchar *>(imageData->constData()),
                   readResult.pixelSize.width(), readResult.pixelSize.height(),
-                  QImage::Format_RGBA8888_Premultiplied, imageCleanupHandler, imageData);
+                  imageFormat, imageCleanupHandler, imageData);
 }
 
 QImage videoFramePlaneAsImage(QVideoFrame &frame, int plane, QImage::Format targetFormat,

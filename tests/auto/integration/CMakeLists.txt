@@ -36,6 +36,7 @@ if(TARGET Qt::Widgets)
 endif()
 if(TARGET Qt::Quick)
     add_subdirectory(qquickvideooutput)
+    add_subdirectory(qquickvideostereo)
     add_subdirectory(qquickvideooutput_window)
 
     if(NOT UIKIT AND NOT ANDROID AND NOT QNX AND NOT VXWORKS) # FIXME: Add support for cross-compiled platforms by adding qml files as resources

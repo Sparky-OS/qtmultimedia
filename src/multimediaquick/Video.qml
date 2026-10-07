@@ -147,6 +147,32 @@ Item {
     */
     property alias mirrored:         videoOut.mirrored
 
+    /*!
+        \qmlproperty enumeration Video::stereoInput
+        \qmlproperty bool Video::stereoSwapEyes
+        \qmlproperty enumeration Video::stereoView
+        \qmlproperty bool Video::stereoShapeFallback
+        \qmlproperty enumeration Video::stereoScaling
+        \qmlproperty enumeration Video::stereoSurface
+        \qmlproperty bool Video::stereoVideo
+        \qmlproperty enumeration Video::stereoPacking
+        \qmlproperty bool Video::stereoLayerSupported
+        \qmlproperty bool Video::stereoLayerActive
+
+        These are the stereoscopic 3D properties of VideoOutput, see
+        \l {VideoOutput::stereoInput}{VideoOutput}.
+    */
+    property alias stereoInput:         videoOut.stereoInput
+    property alias stereoSwapEyes:      videoOut.stereoSwapEyes
+    property alias stereoView:          videoOut.stereoView
+    property alias stereoShapeFallback: videoOut.stereoShapeFallback
+    property alias stereoScaling:       videoOut.stereoScaling
+    property alias stereoSurface:       videoOut.stereoSurface
+    readonly property alias stereoVideo:          videoOut.stereoVideo
+    readonly property alias stereoPacking:        videoOut.stereoPacking
+    readonly property alias stereoLayerSupported: videoOut.stereoLayerSupported
+    readonly property alias stereoLayerActive:    videoOut.stereoLayerActive
+
 
     /*** Properties of MediaPlayer ***/
 
