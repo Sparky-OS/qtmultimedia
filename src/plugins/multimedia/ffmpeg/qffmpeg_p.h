@@ -18,6 +18,8 @@
 #include <QtFFmpegMediaPluginImpl/private/qffmpegcodec_p.h>
 #include <QtFFmpegMediaPluginImpl/private/qffmpegavaudioformat_p.h>
 #include <QtMultimedia/qvideoframeformat.h>
+#include <QtMultimedia/qaudioformat.h>
+#include <QtMultimedia/qaudiodevice.h>
 #include <QtMultimedia/private/qmultimedia_ranges_p.h>
 
 #include <qstring.h>
@@ -282,6 +284,26 @@ const AVPacketSideData *streamSideData(const AVStream *stream, AVPacketSideDataT
 
 SwrContextUPtr createResampleContext(const AVAudioFormat &inputFormat,
                                      const AVAudioFormat &outputFormat);
+
+// How audio is played: the audio sink's format and the resampler. Qt plays the stream's own
+// format and resamples with libswresample's defaults. These can be asked to be better, from
+// the environment (the first listed value is what Qt does without it):
+//  QT_FFMPEG_AUDIO_RESAMPLER=swr|soxr         the engine of libswresample
+//  QT_FFMPEG_AUDIO_RESAMPLER_PRECISION=n      bits of soxr's precision, 15 to 33 (28 is very high quality)
+//  QT_FFMPEG_AUDIO_SINK_SAMPLE_FORMAT=stream|float|int32   for streams of 8 or 16 bits, when the device has it
+//  QT_FFMPEG_AUDIO_SINK_MIN_RATE=0|n          raise the sample rate of the sink to n (Hz), when the device has it
+struct AudioQuality
+{
+    bool soxr = false;
+    int soxrPrecision = 20;
+    QAudioFormat::SampleFormat sinkSampleFormat = QAudioFormat::Unknown; // Unknown: the stream's
+    int sinkMinSampleRate = 0;
+};
+const AudioQuality &audioQuality();
+
+// The format of the audio sink for a stream of the given format: the stream's, or what
+// audioQuality() asks for where the device offers it
+QAudioFormat audioSinkFormat(const QAudioFormat &streamFormat, const QAudioDevice &device);
 
 QVideoFrameFormat::ColorTransfer fromAvColorTransfer(AVColorTransferCharacteristic colorTrc);
 
