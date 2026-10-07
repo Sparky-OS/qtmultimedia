@@ -30,6 +30,8 @@ public slots:
 private slots:
     void testMediaFilesAreSupported();
 
+    void maxLuminance_isTheMasteringDisplaysPeakInNits();
+
     void toImage_retainsThePreviousMappedState_data();
     void toImage_retainsThePreviousMappedState();
 
@@ -52,6 +54,7 @@ private:
 private:
     MaybeUrl m_oneRedFrameVideo{ q23::unexpect };
     MaybeUrl m_colorsVideo{ q23::unexpect };
+    MaybeUrl m_masteringVideo{ q23::unexpect };
     MediaFileSelector m_mediaSelector;
 };
 
@@ -102,6 +105,7 @@ void tst_QVideoFrameBackend::initTestCase()
 
     m_oneRedFrameVideo = m_mediaSelector.select("qrc:/testdata/one_red_frame.mp4");
     m_colorsVideo = m_mediaSelector.select("qrc:/testdata/colors.mp4");
+    m_masteringVideo = m_mediaSelector.select("qrc:/testdata/mastering_1000nits.mp4");
 }
 
 void tst_QVideoFrameBackend::testMediaFilesAreSupported()
@@ -111,6 +115,27 @@ void tst_QVideoFrameBackend::testMediaFilesAreSupported()
 #endif
 
     QCOMPARE(m_mediaSelector.dumpErrors(), "");
+}
+
+void tst_QVideoFrameBackend::maxLuminance_isTheMasteringDisplaysPeakInNits()
+{
+    // The file is HEVC with the SMPTE ST 2086 mastering display metadata of x265's
+    // --master-display "...L(10000000,1)": a peak of 1000 cd/m2 (the unit of the frame's
+    // AVMasteringDisplayMetadata, a rational that is 10000000/10000 here)
+    if (!m_masteringVideo)
+        QSKIP("The media file cannot be opened, see testMediaFilesAreSupported");
+    if (isGStreamerPlatform())
+        QSKIP("Only the FFmpeg backend reads the mastering display metadata");
+
+    TestVideoSink sink;
+    QMediaPlayer player;
+    player.setVideoOutput(&sink);
+    player.setSource(*m_masteringVideo);
+    player.play();
+
+    const QVideoFrame frame = sink.waitForFrame();
+    QVERIFY(frame.isValid());
+    QCOMPARE(frame.surfaceFormat().maxLuminance(), 1000.f);
 }
 
 void tst_QVideoFrameBackend::toImage_retainsThePreviousMappedState_data()
