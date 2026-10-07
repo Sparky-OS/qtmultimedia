@@ -287,7 +287,8 @@ SwrContextUPtr createResampleContext(const AVAudioFormat &inputFormat,
 
 // How audio is played: the audio sink's format and the resampler. Qt plays the stream's own
 // format and resamples with libswresample's defaults. These can be asked to be better, from
-// the environment (the first listed value is what Qt does without it):
+// the environment (the first listed value is what Qt does without it; the edition's defaults are
+// the second values, soxr at 28 bits, float and 48000):
 //  QT_FFMPEG_AUDIO_RESAMPLER=swr|soxr         the engine of libswresample
 //  QT_FFMPEG_AUDIO_RESAMPLER_PRECISION=n      bits of soxr's precision, 15 to 33 (28 is very high quality)
 //  QT_FFMPEG_AUDIO_SINK_SAMPLE_FORMAT=stream|float|int32   for streams of 8 or 16 bits, when the device has it

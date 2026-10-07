@@ -573,8 +573,7 @@ void QQuickVideoOutput::setStereoSwapEyes(bool swap)
     \value StereoRightEye The right eye's view only.
     \value StereoFlat The frame as it is stored, as if the video were not 3D.
 
-    The default value is \c StereoFlat, the frames as they are stored. A video that is not 3D is
-    shown as it is.
+    The default value is \c StereoBothEyes. A video that is not 3D is shown as it is.
 */
 QQuickVideoOutput::StereoView QQuickVideoOutput::stereoView() const
 {
@@ -599,7 +598,7 @@ void QQuickVideoOutput::setStereoView(StereoView view)
 
     Whether a video that says nothing about being 3D is taken for full side by side when it
     is at least 2.5 times as wide as high (two 16:9 pictures next to each other are 32:9). It is
-    the last resort, after the stream's own signal. The default value is \c false.
+    the last resort, after the stream's own signal. The default value is \c true.
 */
 bool QQuickVideoOutput::stereoShapeFallback() const
 {
@@ -629,7 +628,7 @@ void QQuickVideoOutput::setStereoShapeFallback(bool fallback)
     \value StereoBicubic Bicubic (Catmull-Rom).
     \value StereoLanczos Lanczos with three lobes.
 
-    The default value is \c StereoBilinear.
+    The default value is \c StereoLanczos.
 */
 QQuickVideoOutput::StereoScaling QQuickVideoOutput::stereoScaling() const
 {
@@ -660,7 +659,7 @@ void QQuickVideoOutput::setStereoScaling(StereoScaling scaling)
     \value StereoSurfaceBySource The depth of the video: 8 bits for 8 bit video, 10 bits for
            10 bit video, half float above.
 
-    The default value is \c StereoSurface8Bit.
+    The default value is \c StereoSurfaceBySource.
 */
 QQuickVideoOutput::StereoSurface QQuickVideoOutput::stereoSurface() const
 {

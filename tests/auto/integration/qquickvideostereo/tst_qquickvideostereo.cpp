@@ -238,10 +238,10 @@ void tst_QQuickVideoStereo::propertiesDefault()
     QQuickVideoOutput output;
     QCOMPARE(output.stereoInput(), QQuickVideoOutput::StereoAutomatic);
     QCOMPARE(output.stereoSwapEyes(), false);
-    QCOMPARE(output.stereoView(), QQuickVideoOutput::StereoFlat);
-    QCOMPARE(output.stereoShapeFallback(), false);
-    QCOMPARE(output.stereoScaling(), QQuickVideoOutput::StereoBilinear);
-    QCOMPARE(output.stereoSurface(), QQuickVideoOutput::StereoSurface8Bit);
+    QCOMPARE(output.stereoView(), QQuickVideoOutput::StereoBothEyes);
+    QCOMPARE(output.stereoShapeFallback(), true); // the edition takes a wide undeclared video for side by side
+    QCOMPARE(output.stereoScaling(), QQuickVideoOutput::StereoLanczos);
+    QCOMPARE(output.stereoSurface(), QQuickVideoOutput::StereoSurfaceBySource);
     QCOMPARE(output.stereoVideo(), false);
     QCOMPARE(output.stereoPacking(), QQuickVideoOutput::StereoNone);
     QCOMPARE(output.stereoLayerActive(), false);
@@ -276,9 +276,13 @@ void tst_QQuickVideoStereo::stereoVideoFromFrames()
 
     // a frame that says nothing, as wide as two 16:9: taken for full side by side when asked
     output.setStereoInput(QQuickVideoOutput::StereoAutomatic);
+    output.setStereoShapeFallback(false);
     sink->setVideoFrame(QVideoFrame(QVideoFrameFormat(QSize(3840, 1080), QVideoFrameFormat::Format_ARGB8888_Premultiplied)));
     QTRY_COMPARE(output.stereoVideo(), false);
+    // 2.39:1 is not as wide as two pictures: not 3D with the fallback on either
     output.setStereoShapeFallback(true);
+    sink->setVideoFrame(QVideoFrame(QVideoFrameFormat(QSize(1912, 800), QVideoFrameFormat::Format_ARGB8888_Premultiplied)));
+    QTRY_COMPARE(output.stereoVideo(), false);
     sink->setVideoFrame(QVideoFrame(QVideoFrameFormat(QSize(3840, 1080), QVideoFrameFormat::Format_ARGB8888_Premultiplied)));
     QTRY_COMPARE(output.stereoVideo(), true);
     QCOMPARE(output.stereoPacking(), QQuickVideoOutput::StereoSideBySideFull);

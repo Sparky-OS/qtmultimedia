@@ -268,10 +268,10 @@ private:
     {
         StereoInput input = StereoAutomatic;
         bool swapEyes = false;
-        StereoView view = StereoFlat;
-        bool shapeFallback = false;
-        StereoScaling scaling = StereoBilinear;
-        StereoSurface surface = StereoSurface8Bit;
+        StereoView view = StereoBothEyes;
+        bool shapeFallback = true;
+        StereoScaling scaling = StereoLanczos;
+        StereoSurface surface = StereoSurfaceBySource;
 
         // what the video in hand is
         bool video = false;                // two views in the frames
