@@ -135,9 +135,14 @@ const AVPacketSideData *streamSideData(const AVStream *stream, AVPacketSideDataT
 
 static AudioQuality readAudioQuality()
 {
-    // What Qt does without any of the variables is the default of each; a build for hi-fi
-    // playback only changes these
+    // The edition's defaults: the best the device offers. The variables ask for another one
+    // (QT_FFMPEG_AUDIO_RESAMPLER=swr, QT_FFMPEG_AUDIO_SINK_SAMPLE_FORMAT=stream and
+    // QT_FFMPEG_AUDIO_SINK_MIN_RATE=0 give Qt's own)
     AudioQuality q;
+    q.soxr = true;
+    q.soxrPrecision = 28;
+    q.sinkSampleFormat = QAudioFormat::Float;
+    q.sinkMinSampleRate = 48000;
     const QByteArray resampler = qgetenv("QT_FFMPEG_AUDIO_RESAMPLER");
     if (!resampler.isEmpty())
         q.soxr = resampler == "soxr";
@@ -150,8 +155,10 @@ static AudioQuality readAudioQuality()
         q.sinkSampleFormat = QAudioFormat::Float;
     else if (sampleFormat == "int32")
         q.sinkSampleFormat = QAudioFormat::Int32;
+    else if (sampleFormat == "stream")
+        q.sinkSampleFormat = QAudioFormat::Unknown;
     const int minRate = qEnvironmentVariableIntValue("QT_FFMPEG_AUDIO_SINK_MIN_RATE", &ok);
-    if (ok && minRate > 0)
+    if (ok)
         q.sinkMinSampleRate = minRate;
     return q;
 }
