@@ -439,6 +439,7 @@ set(VIDEO_SHADERS
     "shaders/uyvy.frag"
     "shaders/yuv_triplanar.frag"
     "shaders/yuv_triplanar_p10.frag"
+    "shaders/yuv_triplanar_p16.frag"
     "shaders/yvu_triplanar.frag"
     "shaders/yuyv.frag"
     "shaders/ayuv.frag"
