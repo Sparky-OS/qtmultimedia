@@ -279,13 +279,30 @@ void tst_QQuickVideoStereo::stereoVideoFromFrames()
     output.setStereoShapeFallback(false);
     sink->setVideoFrame(QVideoFrame(QVideoFrameFormat(QSize(3840, 1080), QVideoFrameFormat::Format_ARGB8888_Premultiplied)));
     QTRY_COMPARE(output.stereoVideo(), false);
-    // 2.39:1 is not as wide as two pictures: not 3D with the fallback on either
+    // a single picture is never 3D by its shape: not a scope film (2.39:1, 2.40:1), not the widest
+    // film formats (Ultra Panavision 70, 2.76:1), not a frame just under 3:1
     output.setStereoShapeFallback(true);
-    sink->setVideoFrame(QVideoFrame(QVideoFrameFormat(QSize(1912, 800), QVideoFrameFormat::Format_ARGB8888_Premultiplied)));
-    QTRY_COMPARE(output.stereoVideo(), false);
+    for (const QSize size : { QSize(1912, 800), QSize(1920, 800), QSize(1920, 696), QSize(2999, 1000) }) {
+        sink->setVideoFrame(QVideoFrame(QVideoFrameFormat(QSize(3840, 1080), QVideoFrameFormat::Format_ARGB8888_Premultiplied)));
+        QTRY_COMPARE(output.stereoVideo(), true);
+        sink->setVideoFrame(QVideoFrame(QVideoFrameFormat(size, QVideoFrameFormat::Format_ARGB8888_Premultiplied)));
+        QTRY_VERIFY2(!output.stereoVideo(), qPrintable(QStringLiteral("%1x%2").arg(size.width()).arg(size.height())));
+    }
+    // two pictures next to each other are: full side by side 16:9 (3.56:1), and 3:1 itself
+    for (const QSize size : { QSize(3840, 1080), QSize(1440, 480) }) {
+        sink->setVideoFrame(QVideoFrame(QVideoFrameFormat(QSize(1920, 1080), QVideoFrameFormat::Format_ARGB8888_Premultiplied)));
+        QTRY_COMPARE(output.stereoVideo(), false);
+        sink->setVideoFrame(QVideoFrame(QVideoFrameFormat(size, QVideoFrameFormat::Format_ARGB8888_Premultiplied)));
+        QTRY_VERIFY2(output.stereoVideo(), qPrintable(QStringLiteral("%1x%2").arg(size.width()).arg(size.height())));
+        QCOMPARE(output.stereoPacking(), QQuickVideoOutput::StereoSideBySideFull);
+    }
+    // below 3:1 the application's choice makes it 3D
+    output.setStereoInput(QQuickVideoOutput::StereoSideBySideFull);
+    sink->setVideoFrame(QVideoFrame(QVideoFrameFormat(QSize(1920, 800), QVideoFrameFormat::Format_ARGB8888_Premultiplied)));
+    QTRY_COMPARE(output.stereoVideo(), true);
+    output.setStereoInput(QQuickVideoOutput::StereoAutomatic);
     sink->setVideoFrame(QVideoFrame(QVideoFrameFormat(QSize(3840, 1080), QVideoFrameFormat::Format_ARGB8888_Premultiplied)));
     QTRY_COMPARE(output.stereoVideo(), true);
-    QCOMPARE(output.stereoPacking(), QQuickVideoOutput::StereoSideBySideFull);
 
     // and the other way: nothing but the first of two views is the right eye's with swapped eyes
     output.setStereoView(QQuickVideoOutput::StereoRightEye);
