@@ -597,8 +597,10 @@ void QQuickVideoOutput::setStereoView(StereoView view)
     \qmlproperty bool QtMultimedia::VideoOutput::stereoShapeFallback
 
     Whether a video that says nothing about being 3D is taken for full side by side when it
-    is at least 2.5 times as wide as high (two 16:9 pictures next to each other are 32:9). It is
-    the last resort, after the stream's own signal. The default value is \c true.
+    is at least 3 times as wide as high: two pictures next to each other (two 16:9 pictures are
+    32:9, 3.56:1), never one picture (a scope film is 2.39:1, the widest film formats stay under
+    3:1). It is the last resort, after the stream's own signal and stereoInput; below 3:1 only
+    stereoInput makes a video that says nothing 3D. The default value is \c true.
 */
 bool QQuickVideoOutput::stereoShapeFallback() const
 {
@@ -1161,7 +1163,7 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
         if (st.input != StereoAutomatic) {
             packingFromInput(st.input, &packing);
         } else if (packing.mode == StereoMode::None && st.shapeFallback && !frameSize.isEmpty()
-                   && frameSize.width() >= 2.5 * frameSize.height()) {
+                   && qint64(frameSize.width()) >= 3 * qint64(frameSize.height())) {
             packing = { StereoMode::SideBySide, false, Size::Full };
         }
         if (storedSize != frameSize)
