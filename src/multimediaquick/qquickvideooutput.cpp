@@ -18,6 +18,9 @@
 
 #include <QtMultimediaQuick/private/qsgvideonode_p.h>
 #include <QtMultimediaQuick/private/qquickvideostereo_p.h>
+#ifdef QT_MM_STEREO_POLICY
+#include <stereo-policy.h>
+#endif
 #ifdef QT_MM_STEREO_LAYER
 #include <QtMultimediaQuick/private/qquickvideostereopresenter_p.h>
 
@@ -1162,10 +1165,13 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
         packing.rightEyeFirst = format.stereoFlags().testFlag(QVideoFrameFormat::StereoFlag::RightEyeFirst);
         if (st.input != StereoAutomatic) {
             packingFromInput(st.input, &packing);
-        } else if (packing.mode == StereoMode::None && st.shapeFallback && !frameSize.isEmpty()
-                   && qint64(frameSize.width()) >= 3 * qint64(frameSize.height())) {
+        }
+#ifdef QT_MM_STEREO_POLICY
+        else if (packing.mode == StereoMode::None && st.shapeFallback && !frameSize.isEmpty()
+                   && stereo_policy_video_side_by_side_by_shape(frameSize.width(), frameSize.height()) == 1) {
             packing = { StereoMode::SideBySide, false, Size::Full };
         }
+#endif
         if (storedSize != frameSize)
             packing.displaySize = frameSize;
         twoViews = hasTwoViews(packing.mode) && !frameSize.isEmpty();
