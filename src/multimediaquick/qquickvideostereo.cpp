@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: LicenseRef-Qt-Commercial OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #include "qquickvideostereo_p.h"
+#ifdef QT_MM_STEREO_POLICY
+#include <stereo-policy.h>
+#endif
 
 #include <QtCore/qmath.h>
 #include <QtCore/qfloat16.h>
@@ -31,18 +34,22 @@ bool isFullSize(const Packing &packing, QSize frameSize)
     case Packing::Size::ByShape:
         break;
     }
-    if (frameSize.isEmpty())
-        return false;
-    const qreal aspect = qreal(frameSize.width()) / frameSize.height();
+    // Nothing else says, so the shape does, by the one rule of Sparky Stereo OS's stereo policy; without it the shape
+    // decides nothing
+#ifdef QT_MM_STEREO_POLICY
     switch (packing.mode) {
     case Mode::SideBySide:
     case Mode::SideBySideQuincunx:
-        return aspect >= 2.5;
+        return stereo_policy_video_views_by_shape(frameSize.width(), frameSize.height(), STEREO_POLICY_LAYOUT_SIDE_BY_SIDE) == 1;
     case Mode::TopBottom:
-        return aspect <= 1.2;
+        return stereo_policy_video_views_by_shape(frameSize.width(), frameSize.height(), STEREO_POLICY_LAYOUT_TOP_AND_BOTTOM) == 1;
     default:
         return false;
     }
+#else
+    Q_UNUSED(frameSize)
+    return false;
+#endif
 }
 
 QSize viewSize(const Packing &packing, QSize frameSize)
