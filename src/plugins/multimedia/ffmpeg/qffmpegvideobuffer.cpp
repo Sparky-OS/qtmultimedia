@@ -19,6 +19,21 @@ QT_BEGIN_NAMESPACE
 
 using namespace QFFmpeg;
 
+// FFmpeg's JPEG pixel formats, full range YUV under their own names
+static bool isJpegPixelFormat(AVPixelFormat format)
+{
+    switch (format) {
+    case AV_PIX_FMT_YUVJ420P:
+    case AV_PIX_FMT_YUVJ422P:
+    case AV_PIX_FMT_YUVJ444P:
+    case AV_PIX_FMT_YUVJ440P:
+    case AV_PIX_FMT_YUVJ411P:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool isFrameFlipped(const AVFrame& frame) {
     for (int i = 0; i < AV_NUM_DATA_POINTERS && frame.data[i]; ++i) {
         if (frame.linesize[i] < 0)
@@ -124,11 +139,40 @@ void QFFmpegVideoBuffer::convertSWFrame()
         SwsContextUPtr scaleContext = createSwsContext(actualSize, actualAVPixelFormat, m_size,
                                                        targetAVPixelFormat, SWS_BICUBIC);
 
+        // A full range picture stays full range: its samples keep their values, which for a
+        // depth map are not colors but depths (H.265 G.14.3.4), instead of being squeezed into
+        // the video range of a format without a J
+        const AVPixFmtDescriptor *descriptor = av_pix_fmt_desc_get(actualAVPixelFormat);
+        const bool fullRangeYuv = descriptor && !(descriptor->flags & AV_PIX_FMT_FLAG_RGB)
+                && (m_swFrame->color_range == AVCOL_RANGE_JPEG
+                    || isJpegPixelFormat(actualAVPixelFormat));
+        if (scaleContext && fullRangeYuv) {
+            int *inverseTable = nullptr;
+            int *table = nullptr;
+            int srcRange = 0;
+            int dstRange = 0;
+            int brightness = 0;
+            int contrast = 0;
+            int saturation = 0;
+            if (sws_getColorspaceDetails(scaleContext.get(), &inverseTable, &srcRange, &table,
+                                         &dstRange, &brightness, &contrast, &saturation)
+                >= 0)
+                sws_setColorspaceDetails(scaleContext.get(), inverseTable, 1, table, 1, brightness,
+                                         contrast, saturation);
+        }
+
         auto newFrame = makeAVFrame();
         newFrame->width = m_size.width();
         newFrame->height = m_size.height();
         newFrame->format = targetAVPixelFormat;
         av_frame_get_buffer(newFrame.get(), 0);
+        // the color, the side data and the metadata stay the frame's; the pixels of a frame
+        // scaled to the shape of its pixels are square
+        av_frame_copy_props(newFrame.get(), m_swFrame.get());
+        if (fullRangeYuv)
+            newFrame->color_range = AVCOL_RANGE_JPEG;
+        if (m_size != actualSize)
+            newFrame->sample_aspect_ratio = { 1, 1 };
 
         sws_scale(scaleContext.get(), m_swFrame->data, m_swFrame->linesize, 0, m_swFrame->height,
                   newFrame->data, newFrame->linesize);
