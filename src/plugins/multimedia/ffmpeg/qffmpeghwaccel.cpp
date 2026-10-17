@@ -327,7 +327,13 @@ AVPixelFormat getFormat(AVCodecContext *codecContext, const AVPixelFormat *fmt)
         return *noConversionFormat;
     }
 
-    const AVPixelFormat format = !suggestedFormats.empty() ? suggestedFormats[0] : AV_PIX_FMT_NONE;
+    // The native format is the software one: the hardware formats come first in the list, and one
+    // of the device context's type would be set up after all, since FFmpeg asks again only when
+    // the setup of the format given fails
+    const auto softwareFormat = findIf(suggestedFormats, &isSwPixelFormat);
+    const AVPixelFormat format = softwareFormat ? *softwareFormat
+            : !suggestedFormats.empty()         ? suggestedFormats[0]
+                                                : AV_PIX_FMT_NONE;
     qCDebug(qLHWAccel) << "Selected format with conversion" << format;
 
     // take the native format, this will involve one additional format conversion on the CPU side
