@@ -28,6 +28,7 @@ qt_internal_add_qml_module(MultimediaQuickPrivate
         qquicksoundeffect.cpp qquicksoundeffect_p.h
         qquickvideooutput.cpp qquickvideooutput_p.h
         qquickvideostereo.cpp qquickvideostereo_p.h
+        qquickvideodepth.cpp qquickvideodepth_p.h
         qquickvideostereolayer.cpp qquickvideostereolayer_p.h
         qquickvideostereopresenter.cpp qquickvideostereopresenter_p.h
         qsgvideonode_p.cpp qsgvideonode_p.h
@@ -60,6 +61,12 @@ if(PkgConfig_FOUND)
     pkg_check_modules(STEREO_DECLARE QUIET IMPORTED_TARGET stereo-declare)
     # the one rule for video that says nothing about being 3D, and for full or half views (Sparky Stereo OS)
     pkg_check_modules(STEREO_POLICY QUIET IMPORTED_TARGET stereo-policy)
+    # the views of a picture with its depth map, drawn by libstereo-dibr (Sparky Stereo OS)
+    pkg_check_modules(STEREO_DIBR QUIET IMPORTED_TARGET stereo-dibr>=1.9.0)
+endif()
+if(STEREO_DIBR_FOUND)
+    target_compile_definitions(MultimediaQuickPrivate PRIVATE QT_MM_STEREO_DIBR)
+    target_link_libraries(MultimediaQuickPrivate PRIVATE PkgConfig::STEREO_DIBR)
 endif()
 if(STEREO_POLICY_FOUND)
     target_compile_definitions(MultimediaQuickPrivate PRIVATE QT_MM_STEREO_POLICY)

@@ -23,7 +23,21 @@ using Mode = QVideoFrameFormat::StereoMode;
 
 bool hasTwoViews(Mode mode)
 {
-    return mode != Mode::None && mode != Mode::AnaglyphCyanRed && mode != Mode::AnaglyphGreenMagenta;
+    // the anaglyphs hold both views in the colors; the depth layouts hold one picture and its
+    // depth map, which the views are drawn from (QQuickVideoDepth)
+    switch (mode) {
+    case Mode::None:
+    case Mode::AnaglyphCyanRed:
+    case Mode::AnaglyphGreenMagenta:
+    case Mode::DepthSideBySide:
+    case Mode::DepthTopBottom:
+    case Mode::DepthGraphics:
+    case Mode::DepthBackground:
+    case Mode::DepthSeparate:
+        return false;
+    default:
+        return true;
+    }
 }
 
 bool isFullSize(const Packing &packing, QSize frameSize)

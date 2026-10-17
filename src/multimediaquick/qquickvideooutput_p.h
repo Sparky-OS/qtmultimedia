@@ -26,6 +26,7 @@
 #include <QtMultimedia/qvideoframeformat.h>
 #include <QtMultimedia/qvideosink.h>
 #include <QtMultimediaQuick/private/qtmultimediaquickglobal_p.h>
+#include <QtMultimediaQuick/private/qquickvideodepth_p.h>
 
 #include <atomic>
 #include <memory>
@@ -82,6 +83,35 @@ class Q_MULTIMEDIAQUICK_EXPORT QQuickVideoOutput : public QQuickItem
     Q_PROPERTY(StereoInput stereoPacking READ stereoPacking NOTIFY stereoVideoChanged)
     Q_PROPERTY(bool stereoLayerSupported READ stereoLayerSupported CONSTANT)
     Q_PROPERTY(bool stereoLayerActive READ stereoLayerActive NOTIFY stereoLayerActiveChanged)
+    Q_PROPERTY(bool stereoDepth READ stereoDepth WRITE setStereoDepth NOTIFY stereoDepthChanged)
+    Q_PROPERTY(StereoDepthView stereoDepthView READ stereoDepthView WRITE setStereoDepthView
+                       NOTIFY stereoDepthViewChanged)
+    Q_PROPERTY(StereoDepthWarp stereoDepthWarp READ stereoDepthWarp WRITE setStereoDepthWarp
+                       NOTIFY stereoDepthWarpChanged)
+    Q_PROPERTY(StereoDepthFill stereoDepthFill READ stereoDepthFill WRITE setStereoDepthFill
+                       NOTIFY stereoDepthFillChanged)
+    Q_PROPERTY(StereoDepthSmooth stereoDepthSmooth READ stereoDepthSmooth WRITE setStereoDepthSmooth
+                       NOTIFY stereoDepthSmoothChanged)
+    Q_PROPERTY(qreal stereoDepthSigmaH READ stereoDepthSigmaH WRITE setStereoDepthSigmaH
+                       NOTIFY stereoDepthSigmaHChanged)
+    Q_PROPERTY(qreal stereoDepthSigmaV READ stereoDepthSigmaV WRITE setStereoDepthSigmaV
+                       NOTIFY stereoDepthSigmaVChanged)
+    Q_PROPERTY(int stereoDepthRadius READ stereoDepthRadius WRITE setStereoDepthRadius
+                       NOTIFY stereoDepthRadiusChanged)
+    Q_PROPERTY(qreal stereoDepthRange READ stereoDepthRange WRITE setStereoDepthRange
+                       NOTIFY stereoDepthRangeChanged)
+    Q_PROPERTY(qreal stereoDepthZero READ stereoDepthZero WRITE setStereoDepthZero
+                       NOTIFY stereoDepthZeroChanged)
+    Q_PROPERTY(qreal stereoDepthShift READ stereoDepthShift WRITE setStereoDepthShift
+                       NOTIFY stereoDepthShiftChanged)
+    Q_PROPERTY(StereoDepthMeaning stereoDepthMeaning READ stereoDepthMeaning
+                       WRITE setStereoDepthMeaning NOTIFY stereoDepthMeaningChanged)
+    Q_PROPERTY(qreal stereoDepthNear READ stereoDepthNear WRITE setStereoDepthNear
+                       NOTIFY stereoDepthNearChanged)
+    Q_PROPERTY(qreal stereoDepthFar READ stereoDepthFar WRITE setStereoDepthFar
+                       NOTIFY stereoDepthFarChanged)
+    Q_PROPERTY(QString stereoDepthMark READ stereoDepthMark WRITE setStereoDepthMark
+                       NOTIFY stereoDepthMarkChanged)
     Q_MOC_INCLUDE(qvideosink.h)
     Q_MOC_INCLUDE(qvideoframe.h)
     QML_NAMED_ELEMENT(VideoOutput)
@@ -125,9 +155,62 @@ public:
         StereoFrameSequence,
         StereoAnaglyphCyanRed,
         StereoAnaglyphGreenMagenta,
-        StereoNone
+        StereoNone,
+        // A picture with its depth map (2D plus depth), from which the views are drawn: the depth
+        // layouts of Sparky Stereo OS's depth marks (QVideoFrameFormat::StereoMode)
+        StereoDepthSideBySide,
+        StereoDepthSideBySideDepthFirst,
+        StereoDepthTopBottom,
+        StereoDepthTopBottomDepthFirst,
+        StereoDepthGraphics,
+        StereoDepthBackground,
+        StereoDepthSeparate
     };
     Q_ENUM(StereoInput)
+
+    // The views drawn from a depth map: the choices of libstereo-dibr, see the properties
+    enum StereoDepthView
+    {
+        StereoDepthPictureLeft,
+        StereoDepthPictureCenter
+    };
+    Q_ENUM(StereoDepthView)
+    enum StereoDepthWarp
+    {
+        StereoDepthForward,
+        StereoDepthBackward,
+        StereoDepthLayered
+    };
+    Q_ENUM(StereoDepthWarp)
+    enum StereoDepthFill
+    {
+        StereoDepthFillBackground,
+        StereoDepthFillDepth,
+        StereoDepthFillTelea,
+        StereoDepthFillNone
+    };
+    Q_ENUM(StereoDepthFill)
+    enum StereoDepthSmooth
+    {
+        StereoDepthSmoothOff,
+        StereoDepthSmoothGaussian
+    };
+    Q_ENUM(StereoDepthSmooth)
+    enum StereoDepthMeaning
+    {
+        StereoDepthAutomatic = -1,
+        StereoDepthNearness,
+        StereoDepthFarness,
+        StereoDepthInverseZ,
+        StereoDepthDisparity,
+        StereoDepthZ,
+        StereoDepthNonlinearDisparity,
+        StereoDepthParallax,
+        StereoDepthRangeLinear,
+        StereoDepthRangeInverse,
+        StereoDepthMetric
+    };
+    Q_ENUM(StereoDepthMeaning)
 
     // What is shown of a stereoscopic 3D video
     enum StereoView
@@ -196,6 +279,36 @@ public:
     StereoInput stereoPacking() const;
     static bool stereoLayerSupported();
     bool stereoLayerActive() const;
+    bool stereoDepth() const;
+    void setStereoDepth(bool value);
+    StereoDepthView stereoDepthView() const;
+    void setStereoDepthView(StereoDepthView value);
+    StereoDepthWarp stereoDepthWarp() const;
+    void setStereoDepthWarp(StereoDepthWarp value);
+    StereoDepthFill stereoDepthFill() const;
+    void setStereoDepthFill(StereoDepthFill value);
+    StereoDepthSmooth stereoDepthSmooth() const;
+    void setStereoDepthSmooth(StereoDepthSmooth value);
+    qreal stereoDepthSigmaH() const;
+    void setStereoDepthSigmaH(qreal value);
+    qreal stereoDepthSigmaV() const;
+    void setStereoDepthSigmaV(qreal value);
+    int stereoDepthRadius() const;
+    void setStereoDepthRadius(int value);
+    qreal stereoDepthRange() const;
+    void setStereoDepthRange(qreal value);
+    qreal stereoDepthZero() const;
+    void setStereoDepthZero(qreal value);
+    qreal stereoDepthShift() const;
+    void setStereoDepthShift(qreal value);
+    StereoDepthMeaning stereoDepthMeaning() const;
+    void setStereoDepthMeaning(StereoDepthMeaning value);
+    qreal stereoDepthNear() const;
+    void setStereoDepthNear(qreal value);
+    qreal stereoDepthFar() const;
+    void setStereoDepthFar(qreal value);
+    QString stereoDepthMark() const;
+    void setStereoDepthMark(const QString &value);
 
 Q_SIGNALS:
     void sourceChanged();
@@ -213,6 +326,21 @@ Q_SIGNALS:
     void stereoSurfaceChanged();
     void stereoVideoChanged();
     void stereoLayerActiveChanged();
+    void stereoDepthChanged();
+    void stereoDepthViewChanged();
+    void stereoDepthWarpChanged();
+    void stereoDepthFillChanged();
+    void stereoDepthSmoothChanged();
+    void stereoDepthSigmaHChanged();
+    void stereoDepthSigmaVChanged();
+    void stereoDepthRadiusChanged();
+    void stereoDepthRangeChanged();
+    void stereoDepthZeroChanged();
+    void stereoDepthShiftChanged();
+    void stereoDepthMeaningChanged();
+    void stereoDepthNearChanged();
+    void stereoDepthFarChanged();
+    void stereoDepthMarkChanged();
 
 protected:
     QSGNode *updatePaintNode(QSGNode *, UpdatePaintNodeData *) override;
@@ -272,6 +400,8 @@ private:
         bool shapeFallback = true;
         StereoScaling scaling = StereoLanczos;
         StereoSurface surface = StereoSurfaceBySource;
+        // the views drawn from a depth map
+        QQuickVideoDepth::Options depth;
 
         // what the video in hand is
         bool video = false;                // two views in the frames
@@ -286,6 +416,10 @@ private:
     };
     StereoState m_stereo;
     QVideoFrame m_stereoLastFrame;          // to show again when the choices change
+    // draws the views of a picture with its depth map (libstereo-dibr), from the threads of the
+    // video and of the item in turn
+    QMutex m_depthMutex;
+    std::unique_ptr<QQuickVideoDepth::Renderer> m_depthRenderer;
     // The layer of the views, where the platform has one (QT_MM_STEREO_LAYER): kept in the class
     // whatever the build, so that every user of this header sees the same class
     struct StereoPair;
