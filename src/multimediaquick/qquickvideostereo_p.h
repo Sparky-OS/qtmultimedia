@@ -36,6 +36,8 @@ struct Packing
     QVideoFrameFormat::StereoMode mode = QVideoFrameFormat::StereoMode::None;
     bool rightEyeFirst = false;
     enum class Size { ByShape, Half, Full } size = Size::ByShape;
+    // the depth layouts: the depth map comes first (QVideoFrameFormat::StereoFlag::DepthFirst)
+    bool depthFirst = false;
     // The size the frame is shown at, when it is not the size it is stored in (a frame the
     // backend left unscaled to the shape of its pixels, QVideoFrameFormat::pixelAspectRatio()):
     // the views are then restored from the stored samples to the size of a view of this

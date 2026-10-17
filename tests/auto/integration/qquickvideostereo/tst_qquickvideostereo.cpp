@@ -12,11 +12,14 @@
 #include <QtMultimedia/private/qvideoframeconverter_p.h>
 #include <QtMultimediaQuick/private/qquickvideooutput_p.h>
 #include <QtMultimediaQuick/private/qquickvideostereo_p.h>
+#include <QtMultimediaQuick/private/qquickvideodepth_p.h>
+#include <QtCore/qrandom.h>
 
 #include <set>
 
 using namespace QQuickVideoStereo;
 using Mode = QVideoFrameFormat::StereoMode;
+using namespace Qt::StringLiterals;
 
 namespace {
 
@@ -58,6 +61,10 @@ private slots:
     void deepConversion();
     void propertiesDefault();
     void stereoVideoFromFrames();
+    void depthLayouts_data();
+    void depthLayouts();
+    void depthMarks();
+    void depthInVideoOutput();
 };
 
 void tst_QQuickVideoStereo::sizes_data()
@@ -307,6 +314,218 @@ void tst_QQuickVideoStereo::stereoVideoFromFrames()
     // and the other way: nothing but the first of two views is the right eye's with swapped eyes
     output.setStereoView(QQuickVideoOutput::StereoRightEye);
     QTRY_COMPARE(output.implicitWidth(), 1920);
+}
+
+namespace {
+
+// A frame of a depth layout, as a decoder gives it (YUV 4:4:4, full range): a picture of noise in
+// the luma, its depth map a constant 64 with a box of 160 (larger nearer); the graphics and the
+// background of their layouts, a band of depth 250 and a picture of depth 40.
+QVideoFrame depthFrame(Mode mode, bool depthFirst, int w, int h)
+{
+    QRandomGenerator rng(151);
+    QSize size(w, h);
+    switch (mode) {
+    case Mode::DepthSideBySide:
+        size = QSize(2 * w, h);
+        break;
+    case Mode::DepthTopBottom:
+        size = QSize(w, 2 * h);
+        break;
+    case Mode::DepthGraphics:
+        size = QSize(w, 4 * h);
+        break;
+    case Mode::DepthBackground:
+        size = QSize(2 * w, 2 * h);
+        break;
+    default:
+        break;
+    }
+    QVideoFrameFormat format(size, QVideoFrameFormat::Format_YUV444P);
+    format.setColorRange(QVideoFrameFormat::ColorRange_Full);
+    format.setStereoMode(mode);
+    if (depthFirst)
+        format.setStereoFlags(QVideoFrameFormat::StereoFlag::DepthFirst);
+    QVideoFrame frame(format);
+    if (!frame.map(QVideoFrame::WriteOnly))
+        return {};
+    auto picture = [&](int x0, int y0) {
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                frame.bits(0)[(y0 + y) * frame.bytesPerLine(0) + x0 + x] =
+                        uchar(rng.bounded(40, 216));
+                frame.bits(1)[(y0 + y) * frame.bytesPerLine(1) + x0 + x] = 128;
+                frame.bits(2)[(y0 + y) * frame.bytesPerLine(2) + x0 + x] = 128;
+            }
+    };
+    auto depth = [&](int x0, int y0, auto value) {
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                frame.bits(0)[(y0 + y) * frame.bytesPerLine(0) + x0 + x] = uchar(value(x, y));
+                frame.bits(1)[(y0 + y) * frame.bytesPerLine(1) + x0 + x] = 128;
+                frame.bits(2)[(y0 + y) * frame.bytesPerLine(2) + x0 + x] = 128;
+            }
+    };
+    auto boxDepth = [&](int x, int y) {
+        return x >= w / 4 && x < w / 2 && y >= h / 4 && y < 3 * h / 4 ? 160 : 64;
+    };
+    switch (mode) {
+    case Mode::DepthSideBySide:
+        picture(depthFirst ? w : 0, 0);
+        depth(depthFirst ? 0 : w, 0, boxDepth);
+        break;
+    case Mode::DepthTopBottom:
+        picture(0, depthFirst ? h : 0);
+        depth(0, depthFirst ? 0 : h, boxDepth);
+        break;
+    case Mode::DepthGraphics:
+        picture(0, 0);
+        depth(0, h, boxDepth);
+        picture(0, 2 * h);
+        depth(0, 3 * h, [&](int, int) { return 0; }); // no graphics
+        break;
+    case Mode::DepthBackground:
+        picture(0, 0);
+        depth(w, 0, boxDepth);
+        picture(0, h);
+        depth(w, h, [&](int, int) { return 40; });
+        break;
+    default:
+        break;
+    }
+    frame.unmap();
+    return frame;
+}
+
+// The shift of the luma of row y around x from the left view to the right one, by block matching
+double shiftAt(const QVideoFrame &pair, int y, int x, int search)
+{
+    QVideoFrame f = pair;
+    if (!f.map(QVideoFrame::ReadOnly))
+        return qQNaN();
+    const int w = f.width() / 2, half = 4;
+    const uchar *luma = f.bits(0);
+    const int stride = f.bytesPerLine(0);
+    double best = 1e30;
+    int bestDx = 0;
+    for (int dx = -search; dx <= search; ++dx) {
+        double cost = 0;
+        for (int yy = y - half; yy <= y + half; ++yy)
+            for (int xx = x - half; xx <= x + half; ++xx)
+                cost += std::abs(int(luma[yy * stride + xx])
+                                 - int(luma[yy * stride + w + xx + dx]));
+        if (cost < best) {
+            best = cost;
+            bestDx = dx;
+        }
+    }
+    f.unmap();
+    return bestDx;
+}
+
+double expectedParallax(const QString &mark, int sample, int width)
+{
+    QQuickVideoDepth::Options o;
+    Q_UNUSED(o);
+    // nearness, the screen at 0.5 and 58 pixels at 1920 either side (libstereo-dibr)
+    const double v = sample / 255.0;
+    const double range = 58.0 * width / 1920.0;
+    Q_UNUSED(mark);
+    return v >= 0.5 ? -(v - 0.5) / 0.5 * range : (0.5 - v) / 0.5 * range;
+}
+
+} // namespace
+
+void tst_QQuickVideoStereo::depthLayouts_data()
+{
+    QTest::addColumn<int>("mode");
+    QTest::addColumn<bool>("depthFirst");
+    QTest::newRow("side by side") << int(Mode::DepthSideBySide) << false;
+    QTest::newRow("side by side, depth first") << int(Mode::DepthSideBySide) << true;
+    QTest::newRow("top and bottom") << int(Mode::DepthTopBottom) << false;
+    QTest::newRow("top and bottom, depth first") << int(Mode::DepthTopBottom) << true;
+    QTest::newRow("graphics") << int(Mode::DepthGraphics) << false;
+    QTest::newRow("background") << int(Mode::DepthBackground) << false;
+}
+
+void tst_QQuickVideoStereo::depthLayouts()
+{
+    if (!QQuickVideoDepth::canDraw())
+        QSKIP("built without libstereo-dibr");
+    QFETCH(int, mode);
+    QFETCH(bool, depthFirst);
+    const int w = 240, h = 136;
+    const QVideoFrame frame = depthFrame(Mode(mode), depthFirst, w, h);
+    QVERIFY(frame.isValid());
+    QQuickVideoDepth::Renderer renderer;
+    QVideoFrame pair;
+    QCOMPARE(renderer.draw(frame, Mode(mode), depthFirst, {}, {}, &pair),
+             QQuickVideoDepth::Renderer::Result::Drawn);
+    QCOMPARE(pair.size(), QSize(2 * w, h));
+    QCOMPARE(pair.surfaceFormat().stereoMode(), Mode::SideBySide);
+    QCOMPARE(pair.pixelFormat(), QVideoFrameFormat::Format_YUV444P);
+    // the background (64) and the box (160) at their parallax, to the pixel
+    QCOMPARE(shiftAt(pair, h / 8, w * 3 / 4, 12), qRound(expectedParallax({}, 64, w)));
+    QCOMPARE(shiftAt(pair, h / 2, w * 3 / 8, 12), qRound(expectedParallax({}, 160, w)));
+    QCOMPARE(QQuickVideoDepth::pictureRect(Mode(mode), depthFirst, frame.size()).size(),
+             QSize(w, h));
+}
+
+void tst_QQuickVideoStereo::depthMarks()
+{
+    if (!QQuickVideoDepth::canDraw())
+        QSKIP("built without libstereo-dibr");
+    const int w = 240, h = 136;
+    const QVideoFrame frame = depthFrame(Mode::DepthSideBySide, false, w, h);
+    QQuickVideoDepth::Renderer renderer;
+    QVideoFrame pair;
+    // the stream's mark: larger samples farther, so the box is behind the background
+    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, u"farness"_s, {}, &pair),
+             QQuickVideoDepth::Renderer::Result::Drawn);
+    QCOMPARE(shiftAt(pair, h / 2, w * 3 / 8, 12), -qRound(expectedParallax({}, 160, w)));
+    // the user's meaning comes before it, and the user's mark before both
+    QQuickVideoDepth::Options o;
+    o.meaning = 0;
+    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, u"farness"_s, o, &pair),
+             QQuickVideoDepth::Renderer::Result::Drawn);
+    QCOMPARE(shiftAt(pair, h / 2, w * 3 / 8, 12), qRound(expectedParallax({}, 160, w)));
+    o.mark = u"farness"_s;
+    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, {}, o, &pair),
+             QQuickVideoDepth::Renderer::Result::Drawn);
+    QCOMPARE(shiftAt(pair, h / 2, w * 3 / 8, 12), -qRound(expectedParallax({}, 160, w)));
+    // a malformed mark, the user's or the stream's, means one picture
+    o.mark = u"nearness zero=abc"_s;
+    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, {}, o, &pair),
+             QQuickVideoDepth::Renderer::Result::PictureAlone);
+    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, u"nearness zero=abc"_s, {}, &pair),
+             QQuickVideoDepth::Renderer::Result::PictureAlone);
+}
+
+void tst_QQuickVideoStereo::depthInVideoOutput()
+{
+    QQuickVideoOutput output;
+    QVideoSink *sink = output.videoSink();
+    const int w = 240, h = 136;
+    sink->setVideoFrame(depthFrame(Mode::DepthSideBySide, false, w, h));
+    QTRY_COMPARE(output.stereoPacking(), QQuickVideoOutput::StereoDepthSideBySide);
+    QCOMPARE(output.stereoVideo(), true);
+    // a view, or the picture alone: the size of the picture
+    QTRY_COMPARE(output.implicitWidth(), qreal(w));
+    output.setStereoDepth(false);
+    QTRY_COMPARE(output.implicitWidth(), qreal(w));
+    // the frame as stored
+    output.setStereoView(QQuickVideoOutput::StereoFlat);
+    QTRY_COMPARE(output.implicitWidth(), qreal(2 * w));
+    // the user says how an unmarked frame packs its depth
+    output.setStereoView(QQuickVideoOutput::StereoBothEyes);
+    output.setStereoDepth(true);
+    QVideoFrame unmarked = depthFrame(Mode::DepthTopBottom, false, w, h);
+    QVideoFrameFormat format = unmarked.surfaceFormat();
+    QCOMPARE(format.stereoMode(), Mode::DepthTopBottom);
+    output.setStereoInput(QQuickVideoOutput::StereoDepthTopBottom);
+    sink->setVideoFrame(unmarked);
+    QTRY_COMPARE(output.stereoPacking(), QQuickVideoOutput::StereoDepthTopBottom);
+    QTRY_COMPARE(output.implicitHeight(), qreal(h));
 }
 
 QTEST_MAIN(tst_QQuickVideoStereo)
