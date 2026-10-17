@@ -52,7 +52,7 @@ static bool isPacketWithinStreamDuration(const AVFormatContext *context, const P
 
 Demuxer::Demuxer(const PlaybackEngineObjectID &id, AVFormatContext *context,
                  TrackPosition initialPosUs, bool seekPending, const LoopOffset &loopOffset,
-                 const StreamIndexes &streamIndexes, int loops)
+                 const StreamIndexes &streamIndexes, int loops, int depthStreamIndex)
     : PlaybackEngineObject(id),
       m_context(context),
       m_sessionCtx{ initialPosUs, loopOffset, !seekPending && initialPosUs == TrackPosition{ 0 } },
@@ -71,6 +71,11 @@ Demuxer::Demuxer(const PlaybackEngineObjectID &id, AVFormatContext *context,
             qCDebug(qLcDemuxer) << "Activate demuxing stream" << i << ", trackType:" << trackType;
             m_streams[streamIndexes[i]] = { trackType };
         }
+    }
+    // the depth maps of the video's pictures, in a stream of their own, go to the video's decoder
+    if (depthStreamIndex >= 0 && streamIndexes[QPlatformMediaPlayer::VideoStream] >= 0) {
+        qCDebug(qLcDemuxer) << "Activate demuxing the depth stream" << depthStreamIndex;
+        m_streams[depthStreamIndex] = { QPlatformMediaPlayer::VideoStream };
     }
 }
 

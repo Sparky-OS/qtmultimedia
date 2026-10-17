@@ -10,6 +10,7 @@
 
 #include "qffmpeg_p.h"
 #include "qffmpegcodecstorage_p.h"
+#include "qffmpegdepth_p.h"
 #include "qffmpegmediaintegration_p.h"
 #include "qffmpegvideobuffer_p.h"
 #include "qscopedvaluerollback.h"
@@ -355,6 +356,15 @@ AVPixelFormat getFormat(AVCodecContext *codecContext, const AVPixelFormat *fmt)
         }
 
         auto format = formatAndScore.value;
+        // No hardware decoder outputs the depth auxiliary layer of an H.265 stream: a stream that
+        // has one (the decoder says it, depth_available) is decoded in software when its depth
+        // pictures are asked for (depth_output). This comes first, so that no hardware frames are
+        // set up for nothing
+        if (format && decoderOutputsDepthLayer(codecContext)) {
+            qCInfo(qLHWAccel) << "Not decoding in hardware: the stream has a depth layer, which "
+                                 "only software decoding outputs";
+            format = std::nullopt;
+        }
         if (format && !hwFramesKeepDepth(codecContext, *format))
             format = std::nullopt;
         if (format) {

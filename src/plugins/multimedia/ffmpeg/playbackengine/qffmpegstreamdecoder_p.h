@@ -21,6 +21,7 @@
 
 #include <QtCore/qqueue.h>
 
+#include <deque>
 #include <optional>
 
 QT_BEGIN_NAMESPACE
@@ -31,8 +32,12 @@ class StreamDecoder : public PlaybackEngineObject
 {
     Q_OBJECT
 public:
+    // depthCodecContext: the decoder of the stream that holds the depth maps of the pictures (an
+    // ISO/IEC 23002-3 auxiliary video stream, an MP4 auxiliary depth track), whose packets come
+    // to this decoder too
     StreamDecoder(const PlaybackEngineObjectID &id, const CodecContext &codecContext,
-                  TrackPosition absSeekPos);
+                  TrackPosition absSeekPos,
+                  const std::optional<CodecContext> &depthCodecContext = std::nullopt);
 
     ~StreamDecoder() override;
 
@@ -72,8 +77,28 @@ private:
 
     void receiveAVFrames(bool flushPacket = false);
 
+    // Depth as a 3D source: a picture is handed on packed with its depth map (the depth auxiliary
+    // layer of an H.265 stream, or a depth stream of its own) side by side, in one frame
+    // (QFFmpeg::packPictureAndDepth). A picture waits for its depth map while one is to come.
+    struct DepthPending
+    {
+        AVFrameUPtr frame;
+        qint64 time = 0; // AV_TIME_BASE units
+    };
+    bool depthExpected() const;
+    void decodeDepth(const Packet &packet);
+    void receiveDepthFrames();
+    void holdPicture(AVFrameUPtr frame);
+    void holdDepth(AVFrameUPtr frame, const AVStream *stream);
+    void pairDepth(bool final);
+    void clearDepth();
+
 private:
     CodecContext m_codecContext;
+    std::optional<CodecContext> m_depthCodecContext;
+    std::deque<DepthPending> m_heldPictures;
+    std::deque<DepthPending> m_heldDepths;
+    bool m_depthLayer = false; // a depth picture of the stream's depth layer came
 
     const QPlatformMediaPlayer::TrackType m_trackType;
 

@@ -12,8 +12,13 @@ namespace QFFmpeg {
 
 VideoRenderer::VideoRenderer(const PlaybackEngineObjectID &id, const TimeController &tc,
                              QVideoSink *sink, const VideoTransformation &transform,
-                             QVideoFrameFormat::StereoMode streamStereoMode)
-    : Renderer(id, tc), m_sink(sink), m_transform(transform), m_stereoMode(streamStereoMode)
+                             QVideoFrameFormat::StereoMode streamStereoMode,
+                             const StreamDepth &streamDepth)
+    : Renderer(id, tc),
+      m_sink(sink),
+      m_transform(transform),
+      m_stereoMode(streamStereoMode),
+      m_streamDepth(streamDepth)
 {
 }
 
@@ -64,6 +69,24 @@ VideoRenderer::RenderingResult VideoRenderer::renderInternal(Frame frame)
     }
 #endif
 
+    // Depth as a 3D source (qffmpegdepth_p.h): a picture with its depth map, which the stream
+    // decoder packed (the frame's metadata says it) or the track's tags say is packed. What a
+    // depth sample means: the decoder's packing says it from the depth map's side data; else the
+    // frame's own depth side data, else the track's tag.
+    using StereoMode = QVideoFrameFormat::StereoMode;
+    const StreamDepth packed = frameDepth(frame.avFrame());
+    const std::optional<DepthLayout> depthLayout =
+            packed.layout ? packed.layout : m_streamDepth.layout;
+    QString depthMark = packed.mark;
+    if (depthLayout && depthMark.isEmpty()) {
+        const int width = frame.avFrame()->width;
+        const bool halfWidth = depthLayout->mode == StereoMode::DepthSideBySide
+                || depthLayout->mode == StereoMode::DepthBackground;
+        depthMark = depthMarkFromSideData(frame.avFrame(), nullptr, halfWidth ? width / 2 : width);
+        if (depthMark.isEmpty())
+            depthMark = m_streamDepth.mark;
+    }
+
     const auto pixelAspectRatio = codecContext->pixelAspectRatio(frame.avFrame());
     auto buffer = std::make_unique<QFFmpegVideoBuffer>(frame.takeAVFrame(), pixelAspectRatio,
                                                       m_stereoMode, m_sink->preserveNativeSize());
@@ -89,6 +112,11 @@ VideoRenderer::RenderingResult VideoRenderer::renderInternal(Frame frame)
     format.setStereoMode(m_stereoMode);
     format.setStereoFlags(m_stereoFlags);
     format.setStereoView(stereo ? stereo->view : QVideoFrameFormat::StereoView::Packed);
+    if (depthLayout && m_stereoMode == StereoMode::None) {
+        format.setStereoMode(depthLayout->mode);
+        format.setStereoFlags(depthLayout->flags);
+        format.setStereoDepthMark(depthMark);
+    }
     format.setPixelAspectRatio(buffer->pixelAspectRatio());
     QVideoFrame videoFrame = QVideoFramePrivate::createFrame(std::move(buffer), format);
     videoFrame.setStartTime(frame.startTime().get());

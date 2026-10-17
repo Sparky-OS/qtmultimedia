@@ -205,7 +205,8 @@ PlaybackEngine::createRenderer(QPlatformMediaPlayer::TrackType trackType)
     switch (trackType) {
     case QPlatformMediaPlayer::VideoStream:
         return m_videoSink ? createPlaybackEngineObject<VideoRenderer>(
-                       m_timeController, m_videoSink, m_media.transformation(), m_media.stereoMode())
+                                     m_timeController, m_videoSink, m_media.transformation(),
+                                     m_media.stereoMode(), m_media.streamDepth())
                            : RendererPtr{ {}, {} };
     case QPlatformMediaPlayer::AudioStream:
         return m_audioOutput || m_audioBufferOutput
@@ -376,8 +377,10 @@ void PlaybackEngine::createStreamAndRenderer(QPlatformMediaPlayer::TrackType tra
                 &PlaybackEngine::onRendererFinished);
     }
 
-    auto &stream = m_streams[trackType] =
-            createPlaybackEngineObject<StreamDecoder>(*codecContext, renderer->seekPosition());
+    const auto depthContext =
+            trackType == QPlatformMediaPlayer::VideoStream ? depthCodecContext() : std::nullopt;
+    auto &stream = m_streams[trackType] = createPlaybackEngineObject<StreamDecoder>(
+            *codecContext, renderer->seekPosition(), depthContext);
 
     Q_ASSERT(trackType == stream->trackType());
 
@@ -414,6 +417,25 @@ std::optional<CodecContext> PlaybackEngine::codecContextForTrack(QPlatformMediaP
     return codecContext;
 }
 
+std::optional<CodecContext> PlaybackEngine::depthCodecContext()
+{
+    const int streamIndex = m_media.depthStreamIndex();
+    if (streamIndex < 0)
+        return {};
+    if (!m_depthCodecContext) {
+        auto maybeCodecContext = CodecContext::create(m_media.avContext()->streams[streamIndex],
+                                                      m_media.avContext(), m_options);
+        if (!maybeCodecContext) {
+            // the video is shown without its depth maps
+            qCWarning(qLcPlaybackEngine) << "Cannot create the codec of the depth stream"
+                                         << streamIndex << maybeCodecContext.error();
+            return {};
+        }
+        m_depthCodecContext = maybeCodecContext.value();
+    }
+    return m_depthCodecContext;
+}
+
 bool PlaybackEngine::hasMediaStream() const
 {
     return m_renderers[QPlatformMediaPlayer::AudioStream]
@@ -436,9 +458,13 @@ void PlaybackEngine::createDemuxer()
 
     const TrackPosition currentLoopPosUs = currentPosition(false);
 
+    const int depthStreamIndex =
+            streamIndexes[QPlatformMediaPlayer::VideoStream] >= 0 && m_depthCodecContext
+            ? int(m_depthCodecContext->streamIndex())
+            : -1;
     m_demuxer = createPlaybackEngineObject<Demuxer>(m_media.avContext(), currentLoopPosUs,
                                                     m_seekPending, m_currentLoopOffset,
-                                                    streamIndexes, m_loops);
+                                                    streamIndexes, m_loops, depthStreamIndex);
 
     m_seekPending = false;
 
@@ -586,6 +612,8 @@ void PlaybackEngine::setActiveTrack(QPlatformMediaPlayer::TrackType trackType, i
         return;
 
     m_codecContexts[trackType] = {};
+    if (trackType == QPlatformMediaPlayer::VideoStream)
+        m_depthCodecContext = {};
 
     m_renderers[trackType].reset();
     m_streams = defaultObjectsArray<decltype(m_streams)>();

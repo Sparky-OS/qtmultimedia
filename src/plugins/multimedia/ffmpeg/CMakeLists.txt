@@ -30,6 +30,7 @@ qt_internal_add_module(FFmpegMediaPluginImplPrivate
         qffmpegmediaformatinfo.cpp qffmpegmediaformatinfo_p.h
         qffmpegmediaintegration.cpp qffmpegmediaintegration_p.h
         qffmpegvideobuffer.cpp qffmpegvideobuffer_p.h
+        qffmpegdepth.cpp qffmpegdepth_p.h
         qffmpegimagecapture.cpp qffmpegimagecapture_p.h
         qffmpegmediacapturesession.cpp qffmpegmediacapturesession_p.h
         qffmpegmediarecorder.cpp qffmpegmediarecorder_p.h
