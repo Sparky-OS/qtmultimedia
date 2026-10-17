@@ -1374,10 +1374,12 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
 
     bool videoChanged = false;
     bool layerChanged = false;
+    bool eyeChanged = false;
     {
         QMutexLocker lock(&m_frameMutex);
         videoChanged = m_stereo.video != result.video || m_stereo.packing != result.packing;
         layerChanged = m_stereo.layerActive != result.layerActive;
+        eyeChanged = m_stereo.eyeRect != result.eyeRect;
         m_stereo.video = result.video;
         m_stereo.packing = result.packing;
         m_stereo.layerWanted = result.layerWanted;
@@ -1426,7 +1428,13 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
 #endif
         });
     }
-    QMetaObject::invokeMethod(this, &QQuickVideoOutput::_q_newFrame, displaySize);
+    QMetaObject::invokeMethod(this, [this, displaySize, eyeChanged] {
+        // another view of the frame, of the same size (the other eye of a still frame): the area
+        // of the frame that is shown is set again
+        if (eyeChanged)
+            m_geometryDirty = true;
+        _q_newFrame(displaySize);
+    });
 }
 
 std::optional<std::chrono::nanoseconds> QQuickVideoOutput::g_signalBackoff;
