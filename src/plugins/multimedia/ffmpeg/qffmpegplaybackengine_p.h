@@ -192,6 +192,7 @@ private:
     static QString objectThreadName(const PlaybackEngineObject &object);
 
     std::optional<CodecContext> codecContextForTrack(QPlatformMediaPlayer::TrackType trackType);
+    std::optional<CodecContext> depthCodecContext();
 
     bool hasMediaStream() const;
 
@@ -234,6 +235,8 @@ private:
     bool m_seekPending = false;
 
     std::array<std::optional<CodecContext>, QPlatformMediaPlayer::NTrackTypes> m_codecContexts;
+    // the decoder of the depth maps of the video's pictures, in a stream of their own
+    std::optional<CodecContext> m_depthCodecContext;
     int m_loops = QMediaPlayer::Once;
     LoopOffset m_currentLoopOffset;
 

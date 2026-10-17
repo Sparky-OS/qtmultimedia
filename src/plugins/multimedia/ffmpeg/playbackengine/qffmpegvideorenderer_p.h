@@ -19,6 +19,7 @@
 #include <QtMultimedia/qvideoframeformat.h>
 #include <QtMultimedia/private/qvideotransformation_p.h>
 #include <QtCore/qpointer.h>
+#include <QtFFmpegMediaPluginImpl/private/qffmpegdepth_p.h>
 
 QT_BEGIN_NAMESPACE
 
@@ -32,7 +33,8 @@ class VideoRenderer : public Renderer
 public:
     VideoRenderer(const PlaybackEngineObjectID &id, const TimeController &tc, QVideoSink *sink,
                   const VideoTransformation &transform,
-                  QVideoFrameFormat::StereoMode streamStereoMode);
+                  QVideoFrameFormat::StereoMode streamStereoMode,
+                  const StreamDepth &streamDepth = {});
 
     void setOutput(QVideoSink *sink, bool cleanPrevSink = false);
 
@@ -44,6 +46,7 @@ private:
     VideoTransformation m_transform;
     QVideoFrameFormat::StereoMode m_stereoMode;
     QVideoFrameFormat::StereoFlags m_stereoFlags;
+    StreamDepth m_streamDepth;
 };
 
 } // namespace QFFmpeg

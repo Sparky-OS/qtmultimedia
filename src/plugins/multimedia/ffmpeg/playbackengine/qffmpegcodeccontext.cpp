@@ -3,6 +3,7 @@
 
 #include "playbackengine/qffmpegcodeccontext_p.h"
 #include "qffmpegcodecstorage_p.h"
+#include "qffmpegdepth_p.h"
 
 #include <QtMultimedia/qplaybackoptions.h>
 #include <QtCore/qloggingcategory.h>
@@ -120,6 +121,11 @@ q23::expected<CodecContext, QString> CodecContext::create(AVStream *stream,
     AVDictionaryHolder opts;
     if (options.playbackIntent() == QPlaybackOptions::PlaybackIntent::LowLatencyStreaming)
         av_dict_set(opts, "flags", "low_delay", 0);
+
+    // The depth auxiliary layer of an H.265 stream (AuxId 2, the edition's FFmpeg): its pictures
+    // come after their pictures, which the stream decoder packs with them (qffmpegdepth_p.h)
+    if (stream->codecpar->codec_id == AV_CODEC_ID_HEVC && depthWanted())
+        av_dict_set(opts, "depth_output", "both", 0);
 
     av_dict_set(opts, "refcounted_frames", "1", 0);
     av_dict_set(opts, "threads", "auto", 0);

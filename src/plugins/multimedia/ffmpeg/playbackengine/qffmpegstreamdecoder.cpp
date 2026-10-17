@@ -3,6 +3,8 @@
 
 #include "playbackengine/qffmpegstreamdecoder_p.h"
 #include "playbackengine/qffmpegmediadataholder_p.h"
+#include "qffmpegdepth_p.h"
+#include "qffmpeghwaccel_p.h"
 #include <qloggingcategory.h>
 
 QT_BEGIN_NAMESPACE
@@ -12,20 +14,26 @@ Q_STATIC_LOGGING_CATEGORY(qLcStreamDecoder, "qt.multimedia.ffmpeg.streamdecoder"
 namespace QFFmpeg {
 
 StreamDecoder::StreamDecoder(const PlaybackEngineObjectID &id, const CodecContext &codecContext,
-                             TrackPosition absSeekPos)
+                             TrackPosition absSeekPos,
+                             const std::optional<CodecContext> &depthCodecContext)
     : PlaybackEngineObject(id),
       m_codecContext(codecContext),
+      m_depthCodecContext(depthCodecContext),
       m_trackType(MediaDataHolder::trackTypeFromMediaType(codecContext.context()->codec_type)),
       m_sessionCtx{ absSeekPos }
 {
     qCDebug(qLcStreamDecoder) << "Create stream decoder, trackType" << m_trackType
-                              << "absSeekPos:" << absSeekPos.get();
+                              << "absSeekPos:" << absSeekPos.get() << "depth stream:"
+                              << (m_depthCodecContext ? int(m_depthCodecContext->streamIndex())
+                                                      : -1);
     Q_ASSERT(m_trackType != QPlatformMediaPlayer::NTrackTypes);
 }
 
 StreamDecoder::~StreamDecoder()
 {
     avcodec_flush_buffers(m_codecContext.context());
+    if (m_depthCodecContext)
+        avcodec_flush_buffers(m_depthCodecContext->context());
 }
 
 void StreamDecoder::seek(quint64 sessionID, TrackPosition pos, const LoopOffset &offset)
@@ -33,6 +41,9 @@ void StreamDecoder::seek(quint64 sessionID, TrackPosition pos, const LoopOffset 
     updateSession(sessionID, [this, pos, offset]() {
         m_sessionCtx = { offset.loopStartTimeUs.asDuration() + pos };
         avcodec_flush_buffers(m_codecContext.context());
+        if (m_depthCodecContext)
+            avcodec_flush_buffers(m_depthCodecContext->context());
+        clearDepth();
     });
 }
 
@@ -73,6 +84,9 @@ void StreamDecoder::doNextStep()
                                   << packet.loopOffset().loopIndex;
 
         avcodec_flush_buffers(m_codecContext.context());
+        if (m_depthCodecContext)
+            avcodec_flush_buffers(m_depthCodecContext->context());
+        clearDepth();
         m_sessionCtx.offset = packet.loopOffset();
     }
 
@@ -137,6 +151,14 @@ void StreamDecoder::onFrameFound(const Frame &frame)
 
 void StreamDecoder::decodeMedia(const Packet &packet)
 {
+    if (m_depthCodecContext && packet.isValid()
+        && packet.avPacket()->stream_index == int(m_depthCodecContext->streamIndex())) {
+        decodeDepth(packet);
+        return;
+    }
+    if (m_depthCodecContext && !packet.isValid())
+        decodeDepth(packet); // the end: the last depth maps first
+
     auto sendPacketResult = sendAVPacket(packet);
 
     if (sendPacketResult == AVERROR(EAGAIN)) {
@@ -195,8 +217,133 @@ void StreamDecoder::receiveAVFrames(bool flushPacket)
         if (m_trackType == QPlatformMediaPlayer::VideoStream)
             avFrame = copyFromHwPool(std::move(avFrame));
 
+        if (m_trackType == QPlatformMediaPlayer::VideoStream
+            && frameAuxiliaryId(avFrame.get()) == 2) {
+            // a picture of the depth layer, after its picture
+            m_depthLayer = true;
+            holdDepth(std::move(avFrame), m_codecContext.stream());
+            pairDepth(false);
+            continue;
+        }
+        if (m_trackType == QPlatformMediaPlayer::VideoStream && depthExpected()) {
+            holdPicture(std::move(avFrame));
+            pairDepth(false);
+            continue;
+        }
+
         onFrameFound({ m_sessionCtx.offset, std::move(avFrame), m_codecContext, id() });
     }
+    if (flushPacket)
+        pairDepth(true);
+}
+
+bool StreamDecoder::depthExpected() const
+{
+    if (m_depthCodecContext || m_depthLayer)
+        return true;
+    // the decoder says whether the stream has a depth layer, whose pictures it outputs
+    return decoderOutputsDepthLayer(m_codecContext.context());
+}
+
+void StreamDecoder::decodeDepth(const Packet &packet)
+{
+    AVCodecContext *context = m_depthCodecContext->context();
+    int result = avcodec_send_packet(context, packet.isValid() ? packet.avPacket() : nullptr);
+    if (result == AVERROR(EAGAIN)) {
+        receiveDepthFrames();
+        result = avcodec_send_packet(context, packet.isValid() ? packet.avPacket() : nullptr);
+    }
+    if (result == 0 || !packet.isValid())
+        receiveDepthFrames();
+    pairDepth(false);
+}
+
+void StreamDecoder::receiveDepthFrames()
+{
+    while (true) {
+        auto avFrame = makeAVFrame();
+        if (avcodec_receive_frame(m_depthCodecContext->context(), avFrame.get()) < 0)
+            break;
+        holdDepth(std::move(avFrame), m_depthCodecContext->stream());
+    }
+}
+
+static qint64 frameTime(const AVFrame *frame, const AVStream *stream)
+{
+    const int64_t pts = frame->best_effort_timestamp != AV_NOPTS_VALUE
+            ? frame->best_effort_timestamp
+            : frame->pts;
+    return pts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE
+                                 : av_rescale_q(pts, stream->time_base, AV_TIME_BASE_Q);
+}
+
+void StreamDecoder::holdPicture(AVFrameUPtr frame)
+{
+    const qint64 time = frameTime(frame.get(), m_codecContext.stream());
+    m_heldPictures.push_back({ std::move(frame), time });
+}
+
+void StreamDecoder::holdDepth(AVFrameUPtr frame, const AVStream *stream)
+{
+    const qint64 time = frameTime(frame.get(), stream);
+    m_heldDepths.push_back({ std::move(frame), time });
+}
+
+void StreamDecoder::pairDepth(bool final)
+{
+    // a depth map belongs to the picture of its time; a millisecond is the tolerance of streams
+    // whose time bases differ
+    constexpr qint64 tolerance = 1000;
+    constexpr size_t maxHeldPictures = 4;
+    while (!m_heldPictures.empty()) {
+        DepthPending &picture = m_heldPictures.front();
+        auto match =
+                std::find_if(m_heldDepths.begin(), m_heldDepths.end(), [&](const DepthPending &d) {
+                    return picture.time != AV_NOPTS_VALUE && d.time != AV_NOPTS_VALUE
+                            && std::abs(d.time - picture.time) <= tolerance;
+                });
+        // frames without times (a raw stream): a depth map goes with the picture it follows, in
+        // order
+        if (match == m_heldDepths.end() && picture.time == AV_NOPTS_VALUE && !m_heldDepths.empty()
+            && m_heldDepths.front().time == AV_NOPTS_VALUE)
+            match = m_heldDepths.begin();
+        AVFrameUPtr out;
+        if (match != m_heldDepths.end()) {
+            out = packPictureAndDepth(picture.frame.get(), match->frame.get());
+            if (!out)
+                qCWarning(qLcStreamDecoder) << "The picture could not be packed with its depth map";
+            m_heldDepths.erase(m_heldDepths.begin(), match + 1);
+        } else {
+            // a depth map later than the picture: the picture's own is not coming
+            const bool missed =
+                    !m_heldDepths.empty() && m_heldDepths.back().time > picture.time + tolerance;
+            if (!final && !missed && m_heldPictures.size() <= maxHeldPictures)
+                break;
+        }
+        if (!out) { // the picture alone
+            qCDebug(qLcStreamDecoder)
+                    << "picture at" << picture.time
+                    << "without its depth map, depth maps held:" << m_heldDepths.size()
+                    << (m_heldDepths.empty() ? -1 : m_heldDepths.front().time);
+            out = std::move(picture.frame);
+        }
+        m_heldPictures.pop_front();
+        onFrameFound({ m_sessionCtx.offset, std::move(out), m_codecContext, id() });
+    }
+    // depth maps older than every picture to come have no picture any more
+    while (!m_heldDepths.empty() && !m_heldPictures.empty()
+           && m_heldDepths.front().time + tolerance < m_heldPictures.front().time)
+        m_heldDepths.pop_front();
+    // the decoders' delays differ (frame threads): depth maps may come well before their pictures
+    constexpr size_t maxHeldDepths = 64;
+    while (m_heldDepths.size() > maxHeldDepths)
+        m_heldDepths.pop_front();
+}
+
+void StreamDecoder::clearDepth()
+{
+    m_heldPictures.clear();
+    m_heldDepths.clear();
 }
 
 void StreamDecoder::decodeSubtitle(const Packet &packet)

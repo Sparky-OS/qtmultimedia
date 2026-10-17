@@ -139,6 +139,22 @@ QVideoFrameFormat::StereoMode MediaDataHolder::stereoMode() const
     return QVideoFrameFormat::StereoMode::None;
 }
 
+StreamDepth MediaDataHolder::streamDepth() const
+{
+    const int streamIndex = m_currentAVStreamIndex[QPlatformMediaPlayer::VideoStream];
+    if (streamIndex < 0)
+        return {};
+    return QFFmpeg::streamDepth(m_context->streams[streamIndex]);
+}
+
+int MediaDataHolder::depthStreamIndex() const
+{
+    if (!depthWanted() || m_depthStreams.isEmpty()
+        || m_currentAVStreamIndex[QPlatformMediaPlayer::VideoStream] < 0)
+        return -1;
+    return m_depthStreams.first();
+}
+
 VideoTransformation MediaDataHolder::transformation() const
 {
     // TODO: Add QMediaMetaData::Mirrored and take from it and QMediaMetaData::Orientation:
@@ -374,6 +390,16 @@ MediaDataHolder::MediaDataHolder(AVFormatContextUPtr context,
 
         if (stream->disposition & AV_DISPOSITION_ATTACHED_PIC)
             continue; // Ignore attached picture streams because we treat them as metadata
+
+        if (trackType == QPlatformMediaPlayer::VideoStream && streamAuxiliaryId(stream) == 2) {
+            // the depth map of the pictures of another stream, decoded with them, not a track:
+            // a depth map proper first, a parallax map after
+            if (!streamIsParallaxMap(stream))
+                m_depthStreams.prepend(int(i));
+            else
+                m_depthStreams.append(int(i));
+            continue;
+        }
 
         if (stream->time_base.num <= 0 || stream->time_base.den <= 0) {
             // An invalid stream timebase is not expected to be given by FFmpeg

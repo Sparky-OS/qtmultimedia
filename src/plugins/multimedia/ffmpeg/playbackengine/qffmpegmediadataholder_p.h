@@ -22,6 +22,7 @@
 #include <QtMultimedia/private/qmultimediautils_p.h>
 #include <QtFFmpegMediaPluginImpl/private/qffmpegtime_p.h>
 #include <QtFFmpegMediaPluginImpl/private/qffmpeg_p.h>
+#include <QtFFmpegMediaPluginImpl/private/qffmpegdepth_p.h>
 
 #include <array>
 #include <optional>
@@ -78,6 +79,15 @@ public:
     // values of Matroska's StereoMode, which FFmpeg only gives as the stream's stereo_mode tag
     QVideoFrameFormat::StereoMode stereoMode() const;
 
+    // The depth marks of the video stream's track (STEREO3D_LAYOUT and STEREO3D_DEPTH)
+    StreamDepth streamDepth() const;
+
+    // The stream that holds the depth map of the video stream's pictures, an ISO/IEC 23002-3
+    // auxiliary video stream or an MP4 auxiliary depth track (its AuxId 2; a parallax map draws
+    // the views as a depth map does): decoded with the video, not a track of its own. -1 if
+    // none, or QT_FFMPEG_VIDEO_DEPTH=0.
+    int depthStreamIndex() const;
+
     AVFormatContext *avContext();
 
     int currentStreamIndex(QPlatformMediaPlayer::TrackType trackType) const;
@@ -99,6 +109,8 @@ private:
     bool m_isSeekable = false;
 
     StreamIndexes m_currentAVStreamIndex = { -1, -1, -1 };
+    // the auxiliary video streams that hold depth maps (AuxId 2), the first a depth map proper
+    QList<int> m_depthStreams;
     StreamsMap m_streamMap;
     StreamIndexes m_requestedStreams = { -1, -1, -1 };
     TrackDuration m_duration = TrackDuration(0);

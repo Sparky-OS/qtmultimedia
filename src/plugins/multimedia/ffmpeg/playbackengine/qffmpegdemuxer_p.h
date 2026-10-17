@@ -32,7 +32,7 @@ class Demuxer : public PlaybackEngineObject
 public:
     Demuxer(const PlaybackEngineObjectID &id, AVFormatContext *context, TrackPosition initialPosUs,
             bool seekPending, const LoopOffset &loopOffset, const StreamIndexes &streamIndexes,
-            int loops);
+            int loops, int depthStreamIndex = -1);
 
     void seek(quint64 sessionId, TrackPosition initialPosUs, const LoopOffset &loopOffset);
 
