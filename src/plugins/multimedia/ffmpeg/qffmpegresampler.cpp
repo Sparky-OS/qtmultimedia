@@ -117,6 +117,29 @@ QAudioBuffer QFFmpegResampler::resample(const uint8_t **inputData, int inputSamp
     return QAudioBuffer(samples, m_outputFormat, startTime);
 }
 
+QAudioBuffer QFFmpegResampler::flush()
+{
+    const int maxOutSamples = swr_get_out_samples(m_resampler.get(), 0);
+    if (maxOutSamples <= 0)
+        return {};
+
+    QByteArray samples(m_outputFormat.bytesForFrames(maxOutSamples), Qt::Uninitialized);
+    auto *out = reinterpret_cast<uint8_t *>(samples.data());
+    const int outSamples = swr_convert(m_resampler.get(), &out, maxOutSamples, nullptr, 0);
+    if (outSamples <= 0)
+        return {};
+
+    samples.resize(m_outputFormat.bytesForFrames(outSamples));
+
+    const qint64 startTime = m_outputFormat.durationForFrames(m_samplesProcessed) + m_startTime;
+    m_samplesProcessed += outSamples;
+
+    qCDebug(qLcResamplerTrace).nospace()
+            << "Flushed output buffer. Time stamp: " << startTime << "us. Samples out: "
+            << outSamples;
+    return QAudioBuffer(samples, m_outputFormat, startTime);
+}
+
 int QFFmpegResampler::adjustMaxOutSamples(int inputSamplesCount)
 {
     int maxOutSamples = swr_get_out_samples(m_resampler.get(), inputSamplesCount);

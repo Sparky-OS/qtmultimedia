@@ -27,14 +27,28 @@ public:
 
     RenderingResult renderInternal(Frame frame) override
     {
-        if (!frame.isValid())
+        if (!frame.isValid()) {
+            // the end of the stream: what the resampler still holds back
+            if (m_resampler) {
+                QAudioBuffer tail = m_resampler->flush();
+                if (tail.frameCount() > 0)
+                    emit newAudioBuffer(tail);
+            }
             return {};
+        }
 
         if (!m_resampler)
             m_resampler = QFFmpegResampler::createFromCodecContext(frame.codecContext(), m_format);
 
-        if (m_resampler)
-            emit newAudioBuffer(m_resampler->resample(frame.avFrame()));
+        if (m_resampler) {
+            QAudioBuffer buffer = m_resampler->resample(frame.avFrame());
+            if (buffer.frameCount() > 0)
+                emit newAudioBuffer(buffer);
+            else
+                // a resampler with a delay (the SoX one) gave nothing for this frame yet: no
+                // buffer is read for it, so the next frame is decoded at once
+                doForceStep();
+        }
 
         return {};
     }
@@ -72,7 +86,10 @@ public:
 
     void nextBuffer()
     {
-        Q_ASSERT(m_audioRenderer);
+        // the renderer is gone once the stream has ended (the last buffer, which the resampler
+        // held back, is read after it)
+        if (!m_audioRenderer)
+            return;
         Q_ASSERT(!m_audioRenderer->isStepForced());
 
         m_audioRenderer->doForceStep();
