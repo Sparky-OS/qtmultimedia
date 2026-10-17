@@ -51,6 +51,10 @@ public:
 
     QAudioBuffer resample(const AVFrame *frame);
 
+    // The samples the resampler still holds back at the end of the input (a resampler with a
+    // delay, such as the SoX one, gives them only when told the input has ended)
+    QAudioBuffer flush();
+
     qint64 samplesProcessed() const { return m_samplesProcessed; }
     void setSampleCompensation(qint32 delta, quint32 distance);
     qint32 activeSampleCompensationDelta() const;
