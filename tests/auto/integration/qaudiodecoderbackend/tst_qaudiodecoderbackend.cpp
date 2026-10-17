@@ -528,7 +528,12 @@ void tst_QAudioDecoderBackend::fileTest()
         buffer = d.read();
         QVERIFY(buffer.isValid());
         QTRY_VERIFY(!positionSpy.isEmpty());
-        QCOMPARE(positionSpy.takeLast().at(0).toLongLong(), qlonglong(durationToMs(duration)));
+        // The position is the time of the buffer's first sample; the sum of the durations before
+        // it loses up to a microsecond a buffer (each is whole microseconds), so it can be a
+        // millisecond short where the buffers are of uneven sizes (a resampler to another rate)
+        const qlonglong position = positionSpy.takeLast().at(0).toLongLong();
+        QCOMPARE_GE(position, qlonglong(durationToMs(duration)));
+        QCOMPARE_LE(position, qlonglong(durationToMs(duration)) + 1);
         QCOMPARE_LT(d.position() - durationToMs(duration), 20u);
 
         duration += buffer.duration();
