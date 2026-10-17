@@ -352,7 +352,9 @@ void tst_QVideoFrameFormat::stereoMode()
     const QVideoFrameFormat mono = format;
     const auto modes = { Mode::SideBySide, Mode::TopBottom, Mode::SideBySideQuincunx,
                          Mode::RowInterleaved, Mode::ColumnInterleaved, Mode::Checkerboard,
-                         Mode::FrameSequence, Mode::AnaglyphCyanRed, Mode::AnaglyphGreenMagenta };
+                         Mode::FrameSequence, Mode::AnaglyphCyanRed, Mode::AnaglyphGreenMagenta,
+                         Mode::DepthSideBySide, Mode::DepthTopBottom, Mode::DepthGraphics,
+                         Mode::DepthBackground, Mode::DepthSeparate };
     for (const auto mode : modes) {
         format.setStereoMode(mode);
         QCOMPARE(format.stereoMode(), mode);
@@ -370,6 +372,23 @@ void tst_QVideoFrameFormat::stereoMode()
     QCOMPARE(format.stereoView(), QVideoFrameFormat::StereoView::Right);
     QVERIFY(format != mono);
     format.setStereoView(QVideoFrameFormat::StereoView::Packed);
+    QVERIFY(format == mono);
+
+    // a picture with its depth map: the order of the two, and what a depth sample means
+    format.setStereoMode(Mode::DepthSideBySide);
+    format.setStereoFlags(QVideoFrameFormat::StereoFlag::DepthFirst);
+    QVERIFY(format.stereoFlags().testFlag(QVideoFrameFormat::StereoFlag::DepthFirst));
+    QVERIFY(!format.stereoFlags().testFlag(QVideoFrameFormat::StereoFlag::RightEyeFirst));
+    QVERIFY(format.stereoDepthMark().isEmpty());
+    QVideoFrameFormat marked = format;
+    marked.setStereoDepthMark(QStringLiteral("inverseZ near=0.5 far=64"));
+    QCOMPARE(marked.stereoDepthMark(), QStringLiteral("inverseZ near=0.5 far=64"));
+    QVERIFY(marked != format);
+    QVERIFY(format.stereoDepthMark().isEmpty());
+    marked.setStereoDepthMark({});
+    QVERIFY(marked == format);
+    format.setStereoFlags({});
+    format.setStereoMode(Mode::None);
     QVERIFY(format == mono);
 
     QCOMPARE(int(Mode::None), 0);

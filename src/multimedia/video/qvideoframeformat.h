@@ -140,7 +140,12 @@ public:
         Checkerboard,
         FrameSequence,
         AnaglyphCyanRed,
-        AnaglyphGreenMagenta
+        AnaglyphGreenMagenta,
+        DepthSideBySide,
+        DepthTopBottom,
+        DepthGraphics,
+        DepthBackground,
+        DepthSeparate
     };
     Q_ENUM(StereoMode)
 
@@ -148,7 +153,8 @@ public:
     {
         RightEyeFirst = 0x1,
         Multiview = 0x2,
-        BaseViewRight = 0x4
+        BaseViewRight = 0x4,
+        DepthFirst = 0x8
     };
     Q_DECLARE_FLAGS(StereoFlags, StereoFlag)
     Q_FLAG(StereoFlags)
@@ -231,6 +237,9 @@ public:
 
     StereoView stereoView() const;
     void setStereoView(StereoView view);
+
+    QString stereoDepthMark() const;
+    void setStereoDepthMark(const QString &mark);
 
     QSize pixelAspectRatio() const;
     void setPixelAspectRatio(QSize ratio);
