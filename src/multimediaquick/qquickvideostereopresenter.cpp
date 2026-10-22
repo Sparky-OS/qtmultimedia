@@ -99,15 +99,16 @@ void QQuickVideoStereoPresenter::process(Job &job)
         // each frame is one view (frameView is the eye of the first), the other frame is the other eye's
         const QImage other = qImageFromVideoFrame(
                 job.otherFrame, job.wide ? QVideoFrameImageDepth::Float32 : QVideoFrameImageDepth::Float16);
-        QImage mine = extractView(image, job.packing, 0, job.scaling);
-        QImage theirs = extractView(other, job.packing, 0, job.scaling);
+        QImage mine = storedView(image, job.packing, 0);
+        QImage theirs = storedView(other, job.packing, 0);
         if (mine.isNull() || theirs.isNull() || mine.size() != theirs.size())
             return;
         left = job.frameView == 0 ? mine : theirs;
         right = job.frameView == 0 ? theirs : mine;
     } else {
-        left = extractView(image, job.packing, rightFirst ? 1 : 0, job.scaling);
-        right = extractView(image, job.packing, rightFirst ? 0 : 1, job.scaling);
+        // each view at the resolution the frame carries it: the compositor resizes it once
+        left = storedView(image, job.packing, rightFirst ? 1 : 0);
+        right = storedView(image, job.packing, rightFirst ? 0 : 1);
     }
     if (left.isNull() || right.isNull())
         return;

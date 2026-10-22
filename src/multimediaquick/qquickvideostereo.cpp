@@ -339,6 +339,65 @@ QImage extractView(const QImage &frameImage, const Packing &packing, int index, 
     return result;
 }
 
+QImage storedView(const QImage &frameImage, const Packing &packing, int index)
+{
+    const QImage src = frameImage.format() == QImage::Format_RGBA32FPx4_Premultiplied
+            ? frameImage
+            : frameImage.convertToFormat(QImage::Format_RGBA32FPx4_Premultiplied);
+    if (src.isNull())
+        return {};
+    const QSize frameSize = src.size();
+    const int first = index; // 0 or 1: the view that is first or second in the packing
+    // where the view's samples are: a rectangle, or every second row, column or checker
+    int x0 = 0, y0 = 0, width = frameSize.width(), height = frameSize.height();
+    int rowStep = 1, colStep = 1;
+    bool checker = false;
+    switch (packing.mode) {
+    case Mode::SideBySide:
+    case Mode::SideBySideQuincunx:
+        width = frameSize.width() / 2;
+        x0 = first * width;
+        break;
+    case Mode::TopBottom:
+        height = frameSize.height() / 2;
+        y0 = first * height;
+        break;
+    case Mode::RowInterleaved:
+        rowStep = 2;
+        y0 = first;
+        height = (frameSize.height() - first + 1) / 2;
+        break;
+    case Mode::ColumnInterleaved:
+        colStep = 2;
+        x0 = first;
+        width = (frameSize.width() - first + 1) / 2;
+        break;
+    case Mode::Checkerboard:
+        checker = true;
+        width = frameSize.width() / 2;
+        break;
+    default:
+        break;
+    }
+    if (width <= 0 || height <= 0)
+        return {};
+    QImage view(width, height, QImage::Format_RGBA32FPx4_Premultiplied);
+    for (int y = 0; y < height; ++y) {
+        const int sy = y0 + y * rowStep;
+        const float *line = reinterpret_cast<const float *>(src.constScanLine(sy));
+        float *out = reinterpret_cast<float *>(view.scanLine(y));
+        if (!checker && colStep == 1) {
+            std::copy(line + x0 * 4, line + (x0 + width) * 4, out);
+            continue;
+        }
+        // a checkerboard view's samples shift by one column from row to row
+        const int start = checker ? (sy + first) % 2 : x0;
+        for (int x = 0; x < width; ++x)
+            std::copy_n(line + std::min(start + 2 * x, frameSize.width() - 1) * 4, 4, out + x * 4);
+    }
+    return view;
+}
+
 int bytesPerPixel(BufferFormat format)
 {
     return format == BufferFormat::Xbgr16161616f || format == BufferFormat::Xbgr16161616 ? 8 : 4;
