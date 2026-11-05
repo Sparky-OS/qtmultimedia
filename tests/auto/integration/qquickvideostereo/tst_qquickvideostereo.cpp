@@ -10,9 +10,15 @@
 #include <QtMultimedia/qvideoframeformat.h>
 #include <QtMultimedia/qvideosink.h>
 #include <QtMultimedia/private/qvideoframeconverter_p.h>
+#include <QtMultimedia/private/qhwvideobuffer_p.h>
+#include <QtMultimedia/private/qvideoframe_p.h>
+#include <QtGui/qopenglcontext.h>
+#include <QtGui/qopenglextrafunctions.h>
+#include <rhi/qrhi.h>
 #include <QtMultimediaQuick/private/qquickvideooutput_p.h>
 #include <QtMultimediaQuick/private/qquickvideostereo_p.h>
 #include <QtCore/qtemporarydir.h>
+#include <QtCore/qfile.h>
 #include <QtCore/qfileinfo.h>
 #include <QtMultimediaQuick/private/qquickvideodepth_p.h>
 #include <QtCore/qrandom.h>
@@ -21,6 +27,10 @@
 #include <QtQuick/qquickwindow.h>
 
 #include <algorithm>
+#include <atomic>
+#include <map>
+#include <memory>
+#include <tuple>
 #include <cmath>
 #include <set>
 #include <thread>
@@ -81,6 +91,12 @@ private slots:
     void depthOnTheGpuFromSeveralThreads();
     void depthOnTheGpuConvertsTheColour_data();
     void depthOnTheGpuConvertsTheColour();
+    void depthOnTheGpuKeepsTheDepth_data();
+    void depthOnTheGpuKeepsTheDepth();
+    void depthImportsHardwareFrames_data();
+    void depthImportsHardwareFrames();
+    void depthDeepCases_data();
+    void depthDeepCases();
     void depthInVideoOutput();
     void depthRotated_data();
     void depthRotated();
@@ -694,6 +710,16 @@ void tst_QQuickVideoStereo::depthChoiceIsTold()
     QCOMPARE(c.value(u"budgetMs"_s).toDouble(), 32.0);
     QVERIFY(!c.value(u"gpu"_s).toString().isEmpty());
     QTRY_VERIFY(choice.count() >= 1);
+    // what the GPU has free, for the controls to say beside a way that would not fit: the size and depth the views are drawn at (and the
+    // free bytes when the driver says, -1 when it does not); told for the GPU, and for the person's own way too
+    if (c.value(u"onGpu"_s).toBool()) {
+        QVariantMap m = output.stereoDepthGpuMemory();
+        QTRY_VERIFY(!(m = output.stereoDepthGpuMemory()).isEmpty());
+        QCOMPARE(m.value(u"width"_s).toInt(), w);
+        QCOMPARE(m.value(u"height"_s).toInt(), h);
+        QCOMPARE(m.value(u"bits"_s).toInt(), 8);
+        QVERIFY(m.contains(u"freeBytes"_s));
+    }
     // the timing was kept in the person's cache, and in nothing else
     QVERIFY(QFileInfo::exists(cache.path() + u"/stereo-dibr/timings"_s));
     // the person picks the way: no choice is told
@@ -705,6 +731,7 @@ void tst_QQuickVideoStereo::depthChoiceIsTold()
     // the processor asked for: the C code, said
     output.setStereoDepthGpu(false);
     QTRY_COMPARE(output.stereoDepthChoice().value(u"onGpu"_s).toBool(), false);
+    QTRY_VERIFY(output.stereoDepthGpuMemory().isEmpty()); // the processor draws: no GPU memory to tell
     // a video without depth tells nothing
     QVideoFrameFormat plain(QSize(64, 48), QVideoFrameFormat::Format_YUV420P);
     QVideoFrame frame(plain);
@@ -865,6 +892,531 @@ void tst_QQuickVideoStereo::depthOnTheGpuConvertsTheColour()
     QVERIFY2(std::abs(px[0] - clamped(r)) <= 2 && std::abs(px[1] - clamped(g)) <= 2 && std::abs(px[2] - clamped(b)) <= 2 && px[3] == 255,
              qPrintable(u"RGBA %1 %2 %3 %4, expected %5 %6 %7"_s.arg(px[0]).arg(px[1]).arg(px[2]).arg(px[3]).arg(clamped(r)).arg(clamped(g)).arg(clamped(b))));
     pair.unmap();
+    qunsetenv("XDG_CACHE_HOME");
+}
+
+void tst_QQuickVideoStereo::depthOnTheGpuKeepsTheDepth_data()
+{
+    QTest::addColumn<int>("format");
+    QTest::addColumn<int>("bits");   // the depth of the content
+    QTest::addColumn<int>("shift");  // the code's place in the 16 bit word (P010 keeps it in the high bits)
+    QTest::addColumn<int>("space");
+    QTest::addColumn<bool>("full");
+    const auto yuv = QVideoFrameFormat::Format_YUV420P10;
+    QTest::newRow("YUV 4:2:0 10 bit, BT.709, limited") << int(yuv) << 10 << 0 << int(QVideoFrameFormat::ColorSpace_BT709) << false;
+    QTest::newRow("YUV 4:2:0 10 bit, BT.601, full") << int(yuv) << 10 << 0 << int(QVideoFrameFormat::ColorSpace_BT601) << true;
+    QTest::newRow("P010, BT.2020, limited") << int(QVideoFrameFormat::Format_P010) << 10 << 6 << int(QVideoFrameFormat::ColorSpace_BT2020) << false;
+    QTest::newRow("P016, BT.709, limited") << int(QVideoFrameFormat::Format_P016) << 16 << 0 << int(QVideoFrameFormat::ColorSpace_BT709) << false;
+    QTest::newRow("YUV 4:2:2 16 bit, BT.601, full") << int(QVideoFrameFormat::Format_YUV422P16) << 16 << 0 << int(QVideoFrameFormat::ColorSpace_BT601) << true;
+    QTest::newRow("YUV 4:4:4 16 bit, BT.709, limited") << int(QVideoFrameFormat::Format_YUV444P16) << 16 << 0 << int(QVideoFrameFormat::ColorSpace_BT709) << false;
+}
+
+// The frames of the GPU keep the depth of the source: a ramp that climbs one code of the source (10 bits) or a few words (16 bits)
+// a pixel is a run of equal samples after an 8 bit truncation, and a flat colour whose low bits are odd must come back to the
+// word within the error of the conversion; both as the C code draws them
+void tst_QQuickVideoStereo::depthOnTheGpuKeepsTheDepth()
+{
+    if (!QQuickVideoDepth::canDraw())
+        QSKIP("built without libstereo-dibr");
+    QFETCH(int, format);
+    QFETCH(int, bits);
+    QFETCH(int, shift);
+    QFETCH(int, space);
+    QFETCH(bool, full);
+    QTemporaryDir cache;
+    qputenv("XDG_CACHE_HOME", cache.path().toLocal8Bit());
+    const auto pf = QVideoFrameFormat::PixelFormat(format);
+    const bool semi = pf == QVideoFrameFormat::Format_P010 || pf == QVideoFrameFormat::Format_P016;
+    const int log2w = pf == QVideoFrameFormat::Format_YUV444P16 ? 0 : 1;
+    const int log2h = (pf == QVideoFrameFormat::Format_YUV422P16 || pf == QVideoFrameFormat::Format_YUV444P16) ? 0 : 1;
+    const int w = 128, h = 64;
+    const int unit = 1 << shift;
+    const int lo = bits == 10 ? 300 : 20000, step = bits == 10 ? 1 : 7;
+    const int maxCode = (1 << bits) - 1;
+    const int Ucode = bits == 10 ? 517 : 33001, Vcode = bits == 10 ? 507 : 32001;
+    QVideoFrameFormat f(QSize(2 * w, h), pf);
+    f.setColorSpace(QVideoFrameFormat::ColorSpace(space));
+    f.setColorRange(full ? QVideoFrameFormat::ColorRange_Full : QVideoFrameFormat::ColorRange_Video);
+    f.setStereoMode(Mode::DepthSideBySide);
+    QVideoFrame frame(f);
+    QVERIFY(frame.map(QVideoFrame::WriteOnly));
+    auto word = [&](int plane, int x, int y) { return reinterpret_cast<quint16 *>(frame.bits(plane) + y * frame.bytesPerLine(plane)) + x; };
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < 2 * w; ++x)
+            *word(0, x, y) = quint16((x < w ? lo + x * step : (160 * maxCode) / 255) * unit); // the ramp, and the depth: flat
+    const int cw = (2 * w) >> log2w, ch = h >> log2h;
+    for (int y = 0; y < ch; ++y)
+        for (int x = 0; x < cw; ++x) {
+            const bool picture = (x << log2w) < w;
+            const quint16 u = quint16((picture ? Ucode : (maxCode + 1) / 2) * unit), v = quint16((picture ? Vcode : (maxCode + 1) / 2) * unit);
+            if (semi) {
+                *word(1, 2 * x, y) = u;
+                *word(1, 2 * x + 1, y) = v;
+            } else {
+                *word(1, x, y) = u;
+                *word(2, x, y) = v;
+            }
+        }
+    frame.unmap();
+
+    QQuickVideoDepth::Renderer renderer;
+    auto o = fixedWay();
+    QVideoFrame cpu;
+    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, {}, o, &cpu), QQuickVideoDepth::Renderer::Result::Drawn);
+    QVERIFY(!renderer.lastOnGpu());
+    o.gpu = true;
+    QVideoFrame gpu;
+    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, {}, o, &gpu), QQuickVideoDepth::Renderer::Result::Drawn);
+    if (!renderer.lastOnGpu())
+        QSKIP("no OpenGL context in this environment");
+    // the frame of the source's format and depth, full side by side
+    QCOMPARE(gpu.pixelFormat(), pf);
+    QCOMPARE(gpu.size(), QSize(2 * w, h));
+    QCOMPARE(gpu.surfaceFormat().stereoMode(), Mode::SideBySide);
+    QVERIFY(gpu.map(QVideoFrame::ReadOnly));
+    QVERIFY(cpu.map(QVideoFrame::ReadOnly));
+    auto code = [&](const QVideoFrame &fr, int plane, int x, int y) {
+        return int(*(reinterpret_cast<const quint16 *>(fr.bits(plane) + y * fr.bytesPerLine(plane)) + x)) / unit;
+    };
+    // the ramp, in both views: the codes within the error of the conversion of those the C code draws, none of them lost
+    const int tolerance = bits == 10 ? 1 : 24;
+    auto run = [&](const QVideoFrame &fr, int x0, int x1, int y) {
+        std::set<int> distinct;
+        for (int x = x0; x < x1; ++x)
+            distinct.insert(code(fr, 0, x, y));
+        return distinct;
+    };
+    // an 8 bit truncation of the frame: what the control must see through
+    auto truncated = [&](const QVideoFrame &fr, int x0, int x1, int y) {
+        std::set<int> distinct;
+        for (int x = x0; x < x1; ++x)
+            distinct.insert(code(fr, 0, x, y) >> (bits - 8));
+        return distinct;
+    };
+    const int y = h / 2;
+    for (const int x0 : { 12, w + 12 }) {
+        const int x1 = x0 + w - 24;
+        long worst = 0;
+        for (int x = x0; x < x1; ++x)
+            worst = std::max<long>(worst, std::abs(code(gpu, 0, x, y) - code(cpu, 0, x, y)));
+        QVERIFY2(worst <= tolerance, qPrintable(u"the luma is off the C code's by %1 codes (tolerance %2)"_s.arg(worst).arg(tolerance)));
+        // the ramp is a ramp at the source's depth, not at 8 bits: as many distinct codes as the C code draws, and more than an
+        // 8 bit truncation of the very same frame would leave
+        const size_t drawn = run(gpu, x0, x1, y).size(), reference = run(cpu, x0, x1, y).size();
+        QVERIFY2(drawn * 10 >= reference * 9, qPrintable(u"%1 distinct codes, the C code draws %2"_s.arg(drawn).arg(reference)));
+        const size_t cut = truncated(gpu, x0, x1, y).size();
+        QVERIFY2(drawn > 2 * cut, qPrintable(u"%1 distinct codes against %2 at 8 bits: the low bits were lost"_s.arg(drawn).arg(cut)));
+    }
+    // the control: the same check fails on a frame that was cut to 8 bits and widened again
+    {
+        std::set<int> cutAndWidened;
+        for (int x = 12; x < w - 12; ++x)
+            cutAndWidened.insert((code(gpu, 0, x, y) >> (bits - 8)) << (bits - 8));
+        const size_t drawn = run(gpu, 12, w - 12, y).size();
+        QVERIFY2(cutAndWidened.size() * 2 < drawn, "the control did not see a truncation");
+    }
+    // the flat colour: its chroma back to the words, with the odd low bits
+    const int cx = w / 2, cy = h / 2;
+    for (int plane = 1; plane <= (semi ? 1 : 2); ++plane) {
+        for (int c = 0; c < (semi ? 2 : 1); ++c) {
+            const int expected = (semi ? c == 0 : plane == 1) ? Ucode : Vcode;
+            const int at = (cx >> log2w) * (semi ? 2 : 1) + c;
+            const int g = code(gpu, plane, at, cy >> log2h), r = code(cpu, plane, at, cy >> log2h);
+            const int cTolerance = bits == 10 ? 2 : 24;
+            QVERIFY2(std::abs(g - expected) <= cTolerance, qPrintable(u"chroma %1 of plane %2: %3, the source's %4"_s.arg(c).arg(plane).arg(g).arg(expected)));
+            QVERIFY2(std::abs(g - r) <= cTolerance, qPrintable(u"chroma %1 of plane %2: %3, the C code's %4"_s.arg(c).arg(plane).arg(g).arg(r)));
+        }
+    }
+    gpu.unmap();
+    cpu.unmap();
+    qunsetenv("XDG_CACHE_HOME");
+}
+
+namespace {
+
+// A frame a decoder keeps on a GPU, as far as the passes can tell: its planes are textures of the drawing context that the decoder's
+// converter makes (mapTextures() through the QRhi), and a map() is the read back to system memory, counted
+struct FakeCounts
+{
+    std::atomic<int> maps { 0 };
+    std::atomic<int> mapTextures { 0 };
+};
+
+class FakeTextures : public QVideoFrameTextures
+{
+public:
+    FakeTextures(QRhi &rhi, const std::vector<std::tuple<std::vector<uchar>, int, int, int, int>> &planes, bool deep)
+    {
+        QOpenGLContext *ctx = QOpenGLContext::currentContext();
+        QOpenGLExtraFunctions *f = ctx->extraFunctions();
+        m_context = ctx;
+        for (size_t i = 0; i < planes.size(); ++i) {
+            const auto &[data, stride, w, h, channels] = planes[i];
+            const int bytes = deep ? 2 : 1;
+            unsigned id = 0;
+            f->glGenTextures(1, &id);
+            f->glBindTexture(GL_TEXTURE_2D, id);
+            const unsigned internal = deep ? (channels == 1 ? 0x822A : 0x822C) : (channels == 1 ? GL_R8 : GL_RG8);
+            f->glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            f->glPixelStorei(GL_UNPACK_ROW_LENGTH, stride / (bytes * channels));
+            f->glTexImage2D(GL_TEXTURE_2D, 0, int(internal), w, h, 0, channels == 1 ? GL_RED : GL_RG,
+                            deep ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE, data.data());
+            f->glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+            f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            m_ids[i] = id;
+            const QRhiTexture::Format format = deep ? (channels == 1 ? QRhiTexture::R16 : QRhiTexture::RG16)
+                                                    : (channels == 1 ? QRhiTexture::R8 : QRhiTexture::RG8);
+            m_textures[i].reset(rhi.newTexture(format, QSize(w, h)));
+            m_textures[i]->createFrom({ quint64(id), 0 });
+        }
+    }
+    ~FakeTextures() override
+    {
+        m_textures[0].reset();
+        m_textures[1].reset();
+        if (QOpenGLContext::currentContext() == m_context)
+            m_context->extraFunctions()->glDeleteTextures(2, m_ids);
+    }
+    QRhiTexture *texture(uint plane) const override { return plane < 2 ? m_textures[plane].get() : nullptr; }
+
+private:
+    QOpenGLContext *m_context = nullptr;
+    unsigned m_ids[2] = {};
+    std::unique_ptr<QRhiTexture> m_textures[2];
+};
+
+class FakeHardwareBuffer : public QHwVideoBuffer
+{
+public:
+    using Plane = std::tuple<std::vector<uchar>, int, int, int, int>; // data, stride, width, height, channels
+    FakeHardwareBuffer(QVideoFrameFormat format, std::vector<Plane> planes, bool deep, FakeCounts *counts)
+        : QHwVideoBuffer(QVideoFrame::NoHandle), m_format(std::move(format)), m_planes(std::move(planes)), m_deep(deep), m_counts(counts)
+    {
+    }
+    void initTextureConverter(QRhi &) override { m_type = QVideoFrame::RhiTextureHandle; }
+    QVideoFrameTexturesUPtr mapTextures(QRhi &rhi, QVideoFrameTexturesUPtr &) override
+    {
+        ++m_counts->mapTextures;
+        return std::make_unique<FakeTextures>(rhi, m_planes, m_deep);
+    }
+    MapData map(QVideoFrame::MapMode) override
+    {
+        ++m_counts->maps;
+        MapData d;
+        d.planeCount = int(m_planes.size());
+        for (size_t i = 0; i < m_planes.size(); ++i) {
+            d.data[i] = std::get<0>(m_planes[i]).data();
+            d.bytesPerLine[i] = std::get<1>(m_planes[i]);
+            d.dataSize[i] = int(std::get<0>(m_planes[i]).size());
+        }
+        return d;
+    }
+    QVideoFrameFormat format() const override { return m_format; }
+
+private:
+    QVideoFrameFormat m_format;
+    std::vector<Plane> m_planes;
+    bool m_deep;
+    FakeCounts *m_counts;
+};
+
+} // namespace
+
+void tst_QQuickVideoStereo::depthImportsHardwareFrames_data()
+{
+    QTest::addColumn<int>("format");
+    QTest::newRow("NV12") << int(QVideoFrameFormat::Format_NV12);
+    QTest::newRow("P010") << int(QVideoFrameFormat::Format_P010);
+}
+
+// A frame the decoder keeps on a GPU goes to the passes as its textures, with no read back to system memory; the same views come out
+// as from a frame in system memory; the copy to system memory, when asked for or when the converter refuses, is the only path that
+// reads back, and it is counted and said
+void tst_QQuickVideoStereo::depthImportsHardwareFrames()
+{
+    if (!QQuickVideoDepth::canDraw())
+        QSKIP("built without libstereo-dibr");
+    QFETCH(int, format);
+    const auto pf = QVideoFrameFormat::PixelFormat(format);
+    const bool deep = pf == QVideoFrameFormat::Format_P010;
+    QTemporaryDir cache;
+    qputenv("XDG_CACHE_HOME", cache.path().toLocal8Bit());
+    const int w = 128, h = 64, bytes = deep ? 2 : 1;
+    // the picture (left) is a ramp with a diagonal, the depth map (right) a box at 160 on 64
+    std::vector<uchar> luma(size_t(2 * w) * h * bytes), chroma(size_t(2 * w) * (h / 2) * bytes);
+    auto put = [&](std::vector<uchar> &v, size_t index, int code) {
+        if (deep)
+            reinterpret_cast<quint16 *>(v.data())[index] = quint16(code << 6);
+        else
+            v[index] = uchar(code >> 2);
+    };
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < 2 * w; ++x) {
+            const bool box = x - w >= w / 4 && x - w < w / 2 && y >= h / 4 && y < 3 * h / 4;
+            put(luma, size_t(y) * 2 * w + x, x < w ? 200 + ((x * 3 + y * 5) % 560) : (box ? 160 * 4 : 64 * 4));
+        }
+    for (int y = 0; y < h / 2; ++y)
+        for (int x = 0; x < w; ++x) {
+            put(chroma, size_t(y) * 2 * w + 2 * x, x < w / 2 ? 400 + x : 512);
+            put(chroma, size_t(y) * 2 * w + 2 * x + 1, x < w / 2 ? 600 - x : 512);
+        }
+    QVideoFrameFormat f(QSize(2 * w, h), pf);
+    f.setColorSpace(QVideoFrameFormat::ColorSpace_BT709);
+    f.setColorRange(QVideoFrameFormat::ColorRange_Video);
+    f.setStereoMode(Mode::DepthSideBySide);
+    // the same frame in system memory
+    QVideoFrame memory(f);
+    QVERIFY(memory.map(QVideoFrame::WriteOnly));
+    for (int y = 0; y < h; ++y)
+        std::memcpy(memory.bits(0) + y * memory.bytesPerLine(0), luma.data() + size_t(y) * 2 * w * bytes, size_t(2 * w) * bytes);
+    for (int y = 0; y < h / 2; ++y)
+        std::memcpy(memory.bits(1) + y * memory.bytesPerLine(1), chroma.data() + size_t(y) * 2 * w * bytes, size_t(2 * w) * bytes);
+    memory.unmap();
+
+    auto o = fixedWay();
+    o.gpu = true;
+    QQuickVideoDepth::Renderer reference;
+    QVideoFrame expected;
+    QCOMPARE(reference.draw(memory, Mode::DepthSideBySide, false, {}, o, &expected), QQuickVideoDepth::Renderer::Result::Drawn);
+    if (!reference.lastOnGpu())
+        QSKIP("no OpenGL context in this environment");
+    QCOMPARE(reference.lastFrameRoute(), QQuickVideoDepth::Renderer::FrameRoute::Memory);
+
+    auto hardware = [&](FakeCounts *counts) {
+        std::vector<FakeHardwareBuffer::Plane> planes;
+        planes.emplace_back(luma, 2 * w * bytes, 2 * w, h, 1);
+        planes.emplace_back(chroma, 2 * w * bytes, w, h / 2, 2);
+        return QVideoFramePrivate::createFrame(std::make_unique<FakeHardwareBuffer>(f, std::move(planes), deep, counts), f);
+    };
+    auto same = [&](const QVideoFrame &a, const QVideoFrame &b) {
+        QVideoFrame x = a, y = b;
+        if (!x.map(QVideoFrame::ReadOnly) || !y.map(QVideoFrame::ReadOnly))
+            return false;
+        bool equal = x.size() == y.size() && x.pixelFormat() == y.pixelFormat();
+        for (int p = 0; equal && p < x.planeCount(); ++p)
+            for (int row = 0; equal && row < (p ? x.height() / 2 : x.height()); ++row)
+                equal = std::memcmp(x.bits(p) + row * x.bytesPerLine(p), y.bits(p) + row * y.bytesPerLine(p), size_t(x.width()) * bytes) == 0;
+        x.unmap();
+        y.unmap();
+        return equal;
+    };
+
+    // imported where it is: the textures are mapped, the frame is never read back, the views are the memory frame's
+    {
+        FakeCounts counts;
+        QQuickVideoDepth::Renderer renderer;
+        QVideoFrame drawn;
+        for (int i = 0; i < 3; ++i) {
+            QCOMPARE(renderer.draw(hardware(&counts), Mode::DepthSideBySide, false, {}, o, &drawn),
+                     QQuickVideoDepth::Renderer::Result::Drawn);
+            QVERIFY(renderer.lastOnGpu());
+            QCOMPARE(renderer.lastFrameRoute(), QQuickVideoDepth::Renderer::FrameRoute::Imported);
+        }
+        QCOMPARE(int(counts.maps), 0);
+        QCOMPARE(int(counts.mapTextures), 3);
+        QCOMPARE(renderer.hardwareReadBacks(), 0);
+        QVERIFY(same(drawn, expected));
+    }
+    // the copy asked for (the negative control): the read back shows, the views are the same
+    {
+        FakeCounts counts;
+        QQuickVideoDepth::Renderer renderer;
+        QVideoFrame drawn;
+        auto copy = o;
+        copy.importFrames = false;
+        QCOMPARE(renderer.draw(hardware(&counts), Mode::DepthSideBySide, false, {}, copy, &drawn), QQuickVideoDepth::Renderer::Result::Drawn);
+        QCOMPARE(renderer.lastFrameRoute(), QQuickVideoDepth::Renderer::FrameRoute::Copied);
+        QVERIFY(!renderer.lastFrameRouteWhy().isEmpty());
+        QCOMPARE(int(counts.maps), 1);
+        QCOMPARE(int(counts.mapTextures), 0);
+        QCOMPARE(renderer.hardwareReadBacks(), 1);
+        QVERIFY(same(drawn, expected));
+    }
+    // a converter that refuses the frame (a DMA-BUF the drawing GPU cannot import): copied, said, the same views
+    {
+        FakeCounts counts;
+        class Refusing : public FakeHardwareBuffer
+        {
+        public:
+            using FakeHardwareBuffer::FakeHardwareBuffer;
+            QVideoFrameTexturesUPtr mapTextures(QRhi &, QVideoFrameTexturesUPtr &) override { return nullptr; }
+        };
+        std::vector<FakeHardwareBuffer::Plane> planes;
+        planes.emplace_back(luma, 2 * w * bytes, 2 * w, h, 1);
+        planes.emplace_back(chroma, 2 * w * bytes, w, h / 2, 2);
+        const QVideoFrame frame = QVideoFramePrivate::createFrame(std::make_unique<Refusing>(f, std::move(planes), deep, &counts), f);
+        QQuickVideoDepth::Renderer renderer;
+        QVideoFrame drawn;
+        QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, {}, o, &drawn), QQuickVideoDepth::Renderer::Result::Drawn);
+        QCOMPARE(renderer.lastFrameRoute(), QQuickVideoDepth::Renderer::FrameRoute::Copied);
+        QVERIFY2(renderer.lastFrameRouteWhy().contains(u"refused"_s), qPrintable(renderer.lastFrameRouteWhy()));
+        QCOMPARE(int(counts.maps), 1);
+        QCOMPARE(renderer.hardwareReadBacks(), 1);
+        QVERIFY(same(drawn, expected));
+    }
+    qunsetenv("XDG_CACHE_HOME");
+}
+
+// The cases of the depth captures at 10 and 16 bits (tools/qt/make-deep-cases.py makes the frames from the cases' pictures, DEEP_CASES is their
+// directory): the views the GPU draws against the C code's at the source's depth. The same criterion as the 8 bit cases, in 8 bit
+// equivalents of the codes: fewer than one pixel in 500 off by more than 2, a mean under 0.25
+void tst_QQuickVideoStereo::depthDeepCases_data()
+{
+    QTest::addColumn<QString>("raw");
+    QTest::addColumn<QString>("format");
+    QTest::addColumn<int>("w");
+    QTest::addColumn<int>("h");
+    QTest::addColumn<QString>("layout");
+    QTest::addColumn<bool>("first");
+    QTest::addColumn<QString>("mark");
+    QTest::addColumn<QString>("opts");
+    const QString dir = qEnvironmentVariable("DEEP_CASES");
+    if (dir.isEmpty())
+        return;
+    QFile table(dir + u"/cases.tsv"_s);
+    if (!table.open(QIODevice::ReadOnly))
+        return;
+    while (!table.atEnd()) {
+        const QStringList c = QString::fromUtf8(table.readLine()).remove(u'\n').split(u'\t');
+        if (c.size() < 9)
+            continue;
+        QTest::newRow(qPrintable(c[1])) << dir + u'/' + c[1] << c[2] << c[3].toInt() << c[4].toInt() << c[5] << (c[6] == u"1"_s)
+                                         << (c[0].contains(u"malformed"_s) ? u"nearness zero=abc"_s : c[7]) << c[8];
+    }
+}
+
+void tst_QQuickVideoStereo::depthDeepCases()
+{
+    if (!QQuickVideoDepth::canDraw())
+        QSKIP("built without libstereo-dibr");
+    if (qEnvironmentVariable("DEEP_CASES").isEmpty())
+        QSKIP("DEEP_CASES (the frames of tools/qt/make-deep-cases.py) is not set");
+    QFETCH(QString, raw);
+    QFETCH(QString, format);
+    QFETCH(int, w);
+    QFETCH(int, h);
+    QFETCH(QString, layout);
+    QFETCH(bool, first);
+    QFETCH(QString, mark);
+    QFETCH(QString, opts);
+    QTemporaryDir cache;
+    qputenv("XDG_CACHE_HOME", cache.path().toLocal8Bit());
+    const std::map<QString, std::tuple<QVideoFrameFormat::PixelFormat, int, int, int, bool>> formats = {
+        { u"YUV420P10"_s, { QVideoFrameFormat::Format_YUV420P10, 10, 0, 1, false } },
+        { u"P010"_s, { QVideoFrameFormat::Format_P010, 10, 6, 1, true } },
+        { u"P016"_s, { QVideoFrameFormat::Format_P016, 16, 0, 1, true } },
+        { u"YUV422P16"_s, { QVideoFrameFormat::Format_YUV422P16, 16, 0, 0, false } },
+        { u"YUV444P16"_s, { QVideoFrameFormat::Format_YUV444P16, 16, 0, -1, false } },
+    };
+    const auto [pf, bits, shift, subH, semi] = formats.at(format);
+    const int subV = pf == QVideoFrameFormat::Format_YUV444P16 || pf == QVideoFrameFormat::Format_YUV422P16 ? 0 : 1;
+    const int sub = pf == QVideoFrameFormat::Format_YUV444P16 ? 0 : 1; // chroma width shift
+    Q_UNUSED(subH);
+    QFile file(raw);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    const QByteArray data = file.readAll();
+    const int cw = (w + (1 << sub) - 1) >> sub, ch = (h + (1 << subV) - 1) >> subV;
+    // planar: Y, U, V; semi-planar: Y and the interleaved UV: 16 bit words
+    const size_t ySize = size_t(w) * h * 2, cSize = size_t(cw) * ch * 2 * (semi ? 2 : 1);
+    QVERIFY2(size_t(data.size()) >= ySize + cSize * (semi ? 1 : 2), "the raw frame is smaller than its format says");
+    QVideoFrameFormat f(QSize(w, h), pf);
+    f.setColorSpace(QVideoFrameFormat::ColorSpace_BT709);
+    f.setColorRange(QVideoFrameFormat::ColorRange_Video);
+    const bool tb = layout == u"ab"_s || layout == u"graphics"_s;
+    const Mode mode = layout == u"sbs"_s ? Mode::DepthSideBySide : layout == u"ab"_s ? Mode::DepthTopBottom
+            : layout == u"graphics"_s ? Mode::DepthGraphics : Mode::DepthBackground;
+    Q_UNUSED(tb);
+    f.setStereoMode(mode);
+    QVideoFrame frame(f);
+    QVERIFY(frame.map(QVideoFrame::WriteOnly));
+    auto copyPlane = [&](int plane, const char *from, int rowBytes, int rows) {
+        for (int y = 0; y < rows; ++y)
+            std::memcpy(frame.bits(plane) + y * frame.bytesPerLine(plane), from + size_t(y) * rowBytes, size_t(rowBytes));
+    };
+    copyPlane(0, data.constData(), w * 2, h);
+    if (semi) {
+        copyPlane(1, data.constData() + ySize, cw * 4, ch);
+    } else {
+        copyPlane(1, data.constData() + ySize, cw * 2, ch);
+        copyPlane(2, data.constData() + ySize + cSize, cw * 2, ch);
+    }
+    frame.unmap();
+
+    auto o = fixedWay();
+    o.automatic = false;
+    o.mark = mark;
+    for (const QString &opt : opts.split(u';', Qt::SkipEmptyParts)) {
+        const QString k = opt.section(u'=', 0, 0), v = opt.section(u'=', 1);
+        if (k == u"range"_s) o.range = v.toDouble();
+        else if (k == u"zero"_s) o.zero = v.toDouble();
+        else if (k == u"shift"_s) o.shift = v.toDouble();
+        else if (k == u"view"_s) o.view = v.toInt();
+        else if (k == u"warp"_s) o.warp = v.toInt();
+        else if (k == u"fill"_s) o.fill = v.toInt();
+        else if (k == u"smooth"_s) o.smooth = v.toInt();
+        else if (k == u"sigmaH"_s) o.sigmaH = v.toDouble();
+        else if (k == u"sigmaV"_s) o.sigmaV = v.toDouble();
+        else if (k == u"radius"_s) o.radius = v.toInt();
+    }
+    QQuickVideoDepth::Renderer renderer;
+    QVideoFrame cpu, gpu;
+    const auto rc = renderer.draw(frame, mode, first, {}, o, &cpu);
+    QVERIFY(!renderer.lastOnGpu());
+    o.gpu = true;
+    const auto rg = renderer.draw(frame, mode, first, {}, o, &gpu);
+    if (rc == QQuickVideoDepth::Renderer::Result::PictureAlone) {
+        QCOMPARE(rg, rc); // a malformed mark is one picture on either engine
+        qunsetenv("XDG_CACHE_HOME");
+        return;
+    }
+    QCOMPARE(rc, QQuickVideoDepth::Renderer::Result::Drawn);
+    QCOMPARE(rg, QQuickVideoDepth::Renderer::Result::Drawn);
+    if (!renderer.lastOnGpu())
+        QSKIP("no OpenGL context in this environment");
+    QCOMPARE(gpu.pixelFormat(), pf);
+    QCOMPARE(gpu.size(), cpu.size());
+    QVERIFY(gpu.map(QVideoFrame::ReadOnly));
+    QVERIFY(cpu.map(QVideoFrame::ReadOnly));
+    const double unit = double(1 << shift) * double(1 << (bits - 8));
+    for (int plane = 0; plane < gpu.planeCount(); ++plane) {
+        const int pw = plane == 0 ? gpu.width() : (((gpu.width() + (1 << sub) - 1) >> sub) * (semi ? 2 : 1));
+        const int ph = plane == 0 ? gpu.height() : ((gpu.height() + (1 << subV) - 1) >> subV);
+        long far = 0, over = 0;
+        double sum = 0, maxd = 0;
+        for (int y = 0; y < ph; ++y) {
+            const quint16 *a = reinterpret_cast<const quint16 *>(gpu.bits(plane) + y * gpu.bytesPerLine(plane));
+            const quint16 *b = reinterpret_cast<const quint16 *>(cpu.bits(plane) + y * cpu.bytesPerLine(plane));
+            for (int x = 0; x < pw; ++x) {
+                const double d = std::abs(int(a[x]) - int(b[x])) / unit;
+                sum += d;
+                maxd = std::max(maxd, d);
+                far += d > 2.0;
+                over += d > 0.0;
+            }
+        }
+        const long px = long(pw) * ph;
+        qInfo().noquote() << u"deepcase %1 plane %2: mean %3 max %4 (8 bit codes), off by more than 2: %5 of %6"_s
+                                  .arg(raw.section(u'/', -1)).arg(plane).arg(sum / px, 0, 'f', 4).arg(maxd, 0, 'f', 2).arg(far).arg(px);
+        // luma and 4:4:4 chroma: the 8 bit criterion. Subsampled chroma: the C code moves the chroma samples by whole chroma samples (the
+        // parallax halved and rounded), the GPU moves the pixels of RGB and averages the block of a chroma sample, so the chroma at the edges
+        // of the parallax differs by what the half resolution can hold: the mean stays under 0.3 codes, the pixels off by more than 2
+        // (the edges) under 4 in 100
+        // Telea's fill differs by its order (rings on the GPU, a heap in C): the library bounds the mean only (dibrgltest), so does this
+        const bool telea = opts.contains(u"fill=2"_s);
+        const bool subsampled = plane > 0 && (sub || subV);
+        if (telea) {
+            QVERIFY2(sum / px < 1.5, qPrintable(u"plane %1: mean difference %2 codes"_s.arg(plane).arg(sum / px)));
+        } else if (!subsampled) {
+            QVERIFY2(far * 500 < px, qPrintable(u"plane %1: %2 of %3 pixels off by more than 2 codes"_s.arg(plane).arg(far).arg(px)));
+            QVERIFY2(sum / px < 0.25, qPrintable(u"plane %1: mean difference %2 codes"_s.arg(plane).arg(sum / px)));
+        } else {
+            QVERIFY2(far * 25 < px, qPrintable(u"plane %1: %2 of %3 pixels off by more than 2 codes"_s.arg(plane).arg(far).arg(px)));
+            QVERIFY2(sum / px < 0.3, qPrintable(u"plane %1: mean difference %2 codes"_s.arg(plane).arg(sum / px)));
+        }
+    }
+    gpu.unmap();
+    cpu.unmap();
     qunsetenv("XDG_CACHE_HOME");
 }
 

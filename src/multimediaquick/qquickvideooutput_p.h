@@ -118,6 +118,7 @@ class Q_MULTIMEDIAQUICK_EXPORT QQuickVideoOutput : public QQuickItem
     Q_PROPERTY(bool stereoDepthGpu READ stereoDepthGpu WRITE setStereoDepthGpu
                        NOTIFY stereoDepthGpuChanged)
     Q_PROPERTY(QVariantMap stereoDepthChoice READ stereoDepthChoice NOTIFY stereoDepthChoiceChanged)
+    Q_PROPERTY(QVariantMap stereoDepthGpuMemory READ stereoDepthGpuMemory NOTIFY stereoDepthGpuMemoryChanged)
     Q_MOC_INCLUDE(qvideosink.h)
     Q_MOC_INCLUDE(qvideoframe.h)
     QML_NAMED_ELEMENT(VideoOutput)
@@ -320,6 +321,7 @@ public:
     bool stereoDepthGpu() const;
     void setStereoDepthGpu(bool value);
     QVariantMap stereoDepthChoice() const;
+    QVariantMap stereoDepthGpuMemory() const;
     void setStereoDepthMark(const QString &value);
 
 Q_SIGNALS:
@@ -356,6 +358,7 @@ Q_SIGNALS:
     void stereoDepthAutomaticChanged();
     void stereoDepthGpuChanged();
     void stereoDepthChoiceChanged();
+    void stereoDepthGpuMemoryChanged();
 
 protected:
     QSGNode *updatePaintNode(QSGNode *, UpdatePaintNodeData *) override;
@@ -438,6 +441,8 @@ private:
     // what the automatic way chose for the video that plays (guarded by m_frameMutex)
     QVariantMap m_depthChoice;
     void setDepthChoice(const QQuickVideoDepth::Choice &choice);
+    QVariantMap m_depthGpuMemory;
+    void setDepthGpuMemory(const QQuickVideoDepth::GpuMemory &memory);
     // The layer of the views, where the platform has one (QT_MM_STEREO_LAYER): kept in the class
     // whatever the build, so that every user of this header sees the same class
     struct StereoPair;

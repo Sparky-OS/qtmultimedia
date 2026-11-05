@@ -54,6 +54,9 @@ struct Q_MULTIMEDIAQUICK_EXPORT Options
     // Draw on the GPU when it can (OpenGL, libstereo-dibr's passes); false draws with the C code
     // on the processor
     bool gpu = true;
+    // A frame the decoder keeps on a GPU is read by the passes where it is, no copy to system memory, when the decoder's texture
+    // converter can map it into the drawing context; false: it is copied (the log says which). Same views either way.
+    bool importFrames = true;
     // -1: what the video says; else a kind of libstereo-dibr (0 nearness .. 9 metric)
     int meaning = -1;
     double zNear = 0, zFar = 0; // the near and far distances, when both are set
@@ -88,6 +91,20 @@ struct Q_MULTIMEDIAQUICK_EXPORT Choice
     bool operator==(const Choice &o) const;
 };
 
+// What the GPU that draws has free, for the controls to say beside a way that would not fit (the way is the person's to pick, and
+// runs even then): bytes the driver says are free (-1 when it does not say) and the size and depth the ways are drawn at
+struct Q_MULTIMEDIAQUICK_EXPORT GpuMemory
+{
+    bool valid = false;
+    double freeBytes = -1;
+    int width = 0, height = 0, bits = 8;
+
+    bool operator==(const GpuMemory &o) const
+    {
+        return valid == o.valid && freeBytes == o.freeBytes && width == o.width && height == o.height && bits == o.bits;
+    }
+};
+
 class Q_MULTIMEDIAQUICK_EXPORT Renderer
 {
 public:
@@ -113,6 +130,17 @@ public:
     Choice choice() const;
     // Whether the last draw() was on the GPU
     bool lastOnGpu() const;
+    // The GPU's free memory as of the last draws on it (not valid when drawing on the processor)
+    GpuMemory gpuMemory() const;
+
+    // How the last frame the decoder keeps on a GPU reached the passes: Memory for a frame in system memory (or one this Qt has no
+    // converter for: the read back is the decoder's), Imported where it is (no read back), Copied to system memory (why in
+    // lastFrameRouteWhy())
+    enum class FrameRoute { Memory, Imported, Copied };
+    FrameRoute lastFrameRoute() const;
+    QString lastFrameRouteWhy() const;
+    // The hardware frames this Renderer read back to system memory
+    int hardwareReadBacks() const;
 
 private:
     struct Private;

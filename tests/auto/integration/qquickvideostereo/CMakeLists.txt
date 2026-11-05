@@ -10,6 +10,7 @@ qt_internal_add_test(tst_qquickvideostereo
         tst_qquickvideostereo.cpp
     LIBRARIES
         Qt::Gui
+        Qt::GuiPrivate
         Qt::MultimediaPrivate
         Qt::MultimediaQuickPrivate
         Qt::Qml

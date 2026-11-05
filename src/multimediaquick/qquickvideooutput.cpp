@@ -1246,6 +1246,37 @@ QVariantMap QQuickVideoOutput::stereoDepthChoice() const
     return m_depthChoice;
 }
 
+/*!
+    \qmlproperty var QtMultimedia::VideoOutput::stereoDepthGpuMemory
+
+    What the GPU that draws the views of a depth video has free, for the controls to say beside a way that would not fit: a map
+    with \c freeBytes (what the driver says is free, -1 when it does not say), \c width and \c height (a view's size) and \c bits
+    (the depth of the video). Empty when the processor draws. A way picked by the person runs even when it would not fit.
+*/
+QVariantMap QQuickVideoOutput::stereoDepthGpuMemory() const
+{
+    QMutexLocker lock(&m_frameMutex);
+    return m_depthGpuMemory;
+}
+
+void QQuickVideoOutput::setDepthGpuMemory(const QQuickVideoDepth::GpuMemory &memory)
+{
+    QVariantMap map;
+    if (memory.valid) {
+        map.insert(QStringLiteral("freeBytes"), memory.freeBytes);
+        map.insert(QStringLiteral("width"), memory.width);
+        map.insert(QStringLiteral("height"), memory.height);
+        map.insert(QStringLiteral("bits"), memory.bits);
+    }
+    {
+        QMutexLocker lock(&m_frameMutex);
+        if (m_depthGpuMemory == map)
+            return;
+        m_depthGpuMemory = map;
+    }
+    QMetaObject::invokeMethod(this, &QQuickVideoOutput::stereoDepthGpuMemoryChanged, Qt::QueuedConnection);
+}
+
 void QQuickVideoOutput::setDepthChoice(const QQuickVideoDepth::Choice &choice)
 {
     QVariantMap map;
@@ -1735,6 +1766,7 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
     StereoInput depthInput = StereoNone;
     QRectF depthPictureRect;
     QQuickVideoDepth::Choice depthChoice;
+    QQuickVideoDepth::GpuMemory depthMemory;
     if (frame.isValid()) {
         const QVideoFrameFormat format = frame.surfaceFormat();
         Packing depth;
@@ -1757,6 +1789,7 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
                     input = drawn;
                     alone = false;
                     depthChoice = m_depthRenderer->choice();
+                    depthMemory = m_depthRenderer->gpuMemory();
                 } else if (drawResult == QQuickVideoDepth::Renderer::Result::Failed) {
                     qCDebug(qLcVideo)
                             << "the views of a picture with its depth map could not be drawn";
@@ -1773,6 +1806,7 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
         }
     }
     setDepthChoice(depthChoice);
+    setDepthGpuMemory(depthMemory);
     const bool depthDrawn =
             depthInput != StereoNone && depthPictureRect.isNull() && st.view != StereoFlat;
     shown = input;

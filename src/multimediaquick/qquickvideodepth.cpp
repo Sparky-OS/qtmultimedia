@@ -6,6 +6,8 @@
 #include <QtMultimedia/private/qmultimediautils_p.h>
 #include <QtMultimedia/private/qvideoframeconverter_p.h>
 #include <QtMultimedia/private/qvideotransformation_p.h>
+#include <QtMultimedia/private/qhwvideobuffer_p.h>
+#include <QtMultimedia/private/qvideoframe_p.h>
 #include <QtGui/qimage.h>
 
 #include <QtCore/qloggingcategory.h>
@@ -17,6 +19,8 @@
 #  include <stereo-dibr-gl.h>
 #  if QT_CONFIG(opengl)
 #    include <QtGui/qopenglcontext.h>
+#    include <rhi/qrhi.h>
+#    include <rhi/qrhi_platform.h>
 #    include <QtGui/qopenglextrafunctions.h>
 #    include <QtGui/qoffscreensurface.h>
 #    include <QtGui/qsurfaceformat.h>
@@ -25,6 +29,7 @@
 #endif
 
 #include <array>
+#include <memory>
 #include <cmath>
 #include <cstring>
 #include <utility>
@@ -87,6 +92,8 @@ Options::Options()
     zero = o.zero;
     shift = o.shift;
     automatic = o.automatic != 0;
+    // the decoder's frames are imported where they are, unless QT_MM_DEPTH_COPY_FRAMES asks for the copy to system memory
+    importFrames = !qEnvironmentVariableIntValue("QT_MM_DEPTH_COPY_FRAMES");
 #endif
 }
 
@@ -447,7 +454,9 @@ constexpr unsigned GL_R8_ = 0x8229, GL_RG8_ = 0x822B, GL_RGBA8_ = 0x8058, GL_RED
                    GL_RG_ = 0x8227, GL_RGBA_ = 0x1908, GL_UNSIGNED_BYTE_ = 0x1401,
                    GL_TEXTURE_2D_ = 0x0DE1, GL_UNPACK_ROW_LENGTH_ = 0x0CF2,
                    GL_PACK_ROW_LENGTH_ = 0x0D02, GL_FRAMEBUFFER_ = 0x8D40,
-                   GL_COLOR_ATTACHMENT0_ = 0x8CE0, GL_FRAMEBUFFER_COMPLETE_ = 0x8CD5;
+                   GL_COLOR_ATTACHMENT0_ = 0x8CE0, GL_FRAMEBUFFER_COMPLETE_ = 0x8CD5, GL_R16_ = 0x822A,
+                   GL_RG16_ = 0x822C, GL_RGBA16_ = 0x805B, GL_R16UI_ = 0x8234, GL_RED_INTEGER_ = 0x8D94,
+                   GL_UNSIGNED_SHORT_ = 0x1403;
 
 const char kVertex[] = R"(
 const vec2 p[3] = vec2[3](vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
@@ -464,35 +473,106 @@ uniform int u_mode;       // 0 planar, 1 semi-planar UV, 2 semi-planar VU
 uniform ivec2 u_shift;    // the chroma planes' subsampling, log2 of width and height
 uniform vec2 u_k;         // Kr, Kb
 uniform int u_full;
+// what a sample of the texture is as a code of the source: 8 bit textures hold code / 255, 16 bit ones code / 65535 (the
+// word); u_div turns a word into the code of an 8 bit video (4 for 10 bits in the low bits, 256 for 10 bits in the high
+// bits and for 16 bits), u_max is the largest word of full range, u_mid the word of a chroma of 0
+uniform float u_scale;
+uniform float u_div;
+uniform float u_max;
+uniform float u_mid;
+uniform ivec2 u_origin;   // where the picture starts in the planes (a frame the decoder keeps on the GPU is read in place)
 out vec4 o_color;
 void main()
 {
-    ivec2 at = ivec2(gl_FragCoord.xy);
-    float y = texelFetch(u_y, at, 0).r;
+    ivec2 at = ivec2(gl_FragCoord.xy) + u_origin;
+    float y = texelFetch(u_y, at, 0).r * u_scale;
     ivec2 c = ivec2(at.x >> u_shift.x, at.y >> u_shift.y);
     float u, v;
     if (u_mode == 0) {
-        u = texelFetch(u_u, c, 0).r;
-        v = texelFetch(u_v, c, 0).r;
+        u = texelFetch(u_u, c, 0).r * u_scale;
+        v = texelFetch(u_v, c, 0).r * u_scale;
     } else {
-        vec2 uv = texelFetch(u_u, c, 0).rg;
+        vec2 uv = texelFetch(u_u, c, 0).rg * u_scale;
         u = u_mode == 1 ? uv.r : uv.g;
         v = u_mode == 1 ? uv.g : uv.r;
     }
     float yy, cb, cr;
     if (u_full != 0) {
-        yy = y;
-        cb = (u * 255.0 - 128.0) / 255.0;
-        cr = (v * 255.0 - 128.0) / 255.0;
+        yy = y / u_max;
+        cb = (u - u_mid) / u_max;
+        cr = (v - u_mid) / u_max;
     } else {
-        yy = (y * 255.0 - 16.0) / 219.0;
-        cb = (u * 255.0 - 128.0) / 224.0;
-        cr = (v * 255.0 - 128.0) / 224.0;
+        yy = (y / u_div - 16.0) / 219.0;
+        cb = (u / u_div - 128.0) / 224.0;
+        cr = (v / u_div - 128.0) / 224.0;
     }
     float r = yy + 2.0 * (1.0 - u_k.x) * cr;
     float b = yy + 2.0 * (1.0 - u_k.y) * cb;
     float g = (yy - u_k.x * r - u_k.y * b) / (1.0 - u_k.x - u_k.y);
     o_color = vec4(clamp(vec3(r, g, b), 0.0, 1.0), 1.0);
+}
+)";
+
+// The views (RGBA, unorm) back to the source's planes at the source's depth: the luma of each pixel, or the chroma of the mean
+// of the block of pixels a chroma sample covers; plane 0 Y, 1 U, 2 V, 3 U and V interleaved. The same codes as kConvert.
+const char kEncode[] = R"(
+uniform sampler2D u_target;
+uniform int u_plane;
+uniform ivec2 u_shift;
+uniform ivec2 u_size;
+uniform vec2 u_k;
+uniform int u_full;
+uniform float u_div;
+uniform float u_max;
+uniform float u_mid;
+out vec4 o_color;
+vec3 rgbAt(ivec2 p) { return texelFetch(u_target, clamp(p, ivec2(0), u_size - 1), 0).rgb; }
+float luma(vec3 c) { return u_k.x * c.r + (1.0 - u_k.x - u_k.y) * c.g + u_k.y * c.b; }
+float word_y(float yy) { return u_full != 0 ? yy * u_max : (16.0 + 219.0 * yy) * u_div; }
+float word_c(float c) { return u_full != 0 ? u_mid + c * u_max : (128.0 + 224.0 * c) * u_div; }
+void main()
+{
+    ivec2 at = ivec2(gl_FragCoord.xy);
+    if (u_plane == 0) {
+        o_color = vec4(clamp(word_y(luma(rgbAt(at))), 0.0, 65535.0) / 65535.0, 0.0, 0.0, 1.0);
+        return;
+    }
+    vec3 sum = vec3(0.0);
+    float n = 0.0;
+    for (int j = 0; j < (1 << u_shift.y); j++)
+        for (int i = 0; i < (1 << u_shift.x); i++) {
+            ivec2 p = ivec2((at.x << u_shift.x) + i, (at.y << u_shift.y) + j);
+            if (p.x < u_size.x && p.y < u_size.y) {
+                sum += rgbAt(p);
+                n += 1.0;
+            }
+        }
+    vec3 c = sum / max(n, 1.0);
+    float yy = luma(c);
+    float cb = (c.b - yy) / (2.0 * (1.0 - u_k.y));
+    float cr = (c.r - yy) / (2.0 * (1.0 - u_k.x));
+    float u = clamp(word_c(cb), 0.0, 65535.0) / 65535.0, v = clamp(word_c(cr), 0.0, 65535.0) / 65535.0;
+    o_color = u_plane == 1 ? vec4(u, 0.0, 0.0, 1.0) : u_plane == 2 ? vec4(v, 0.0, 0.0, 1.0) : vec4(u, v, 0.0, 1.0);
+}
+)";
+
+// The luma of a frame as the depth map: the samples as they are (R8), or as the integers they are (R16UI)
+const char kLuma[] = R"(
+uniform sampler2D u_y;
+uniform ivec2 u_origin;
+out vec4 o_color;
+void main()
+{
+    o_color = vec4(texelFetch(u_y, ivec2(gl_FragCoord.xy) + u_origin, 0).r, 0.0, 0.0, 1.0);
+}
+)";
+const char kLumaInt[] = R"(
+uniform sampler2D u_y;
+uniform ivec2 u_origin;
+out uvec4 o_color;
+void main()
+{
+    o_color = uvec4(uint(texelFetch(u_y, ivec2(gl_FragCoord.xy) + u_origin, 0).r * 65535.0 + 0.5), 0u, 0u, 1u);
 }
 )";
 
@@ -507,10 +587,35 @@ void main()
 }
 )";
 
+// The pointers stereo_dibr_unpack() is given for a frame that is not in system memory (it never reads through them: the offsets between
+// them place the pictures)
+constexpr uintptr_t kImportedBase = uintptr_t(1) << 40;
+
 class GpuDrawer
 {
 public:
     enum class Source { Planar, SemiUV, SemiVU, Rgba };
+
+    // A source deeper than 8 bits: its words, and what they mean (see kConvert)
+    struct Deep
+    {
+        bool on = false;
+        int tableBits = 16;    // the bits of the depth samples' table: the samples are the words
+        int precision = 16;    // the bits of the content: the passes' textures never hold less
+        float div = 256, max = 65535, mid = 32768;
+        int log2w = 0, log2h = 0;
+        bool semi = false;
+    };
+
+    // The planes of a frame the decoder keeps on a GPU, as textures of the drawing context (QHwVideoBuffer::mapTextures through a
+    // QRhi that shares it): the passes read them in place, the frame is never read back to system memory
+    struct Imported
+    {
+        bool on = false;
+        unsigned y = 0, uv = 0;
+        QVideoFrameTexturesUPtr textures;
+    };
+
 
     // An OpenGL context belongs to one thread, and a video's frames come from the thread of the
     // decoder, of the item and of the sink in turn: the context lives in a thread of its own, and
@@ -579,6 +684,8 @@ public:
             return fail(QStringLiteral("the OpenGL context could not be made current"), why);
         g_depthContext = m_context.get();
         m_f = m_context->extraFunctions();
+        // 16 bit normalised textures: in the core profile always, on OpenGL ES with GL_EXT_texture_norm16
+        m_deepOk = !m_context->isOpenGLES() || m_context->hasExtension(QByteArrayLiteral("GL_EXT_texture_norm16"));
         m_gl = stereo_dibr_gl_create(resolveGl,
                                      m_context->isOpenGLES() ? STEREO_DIBR_GL_ES
                                                              : STEREO_DIBR_GL_DESKTOP);
@@ -592,6 +699,98 @@ public:
         return true;
     }
 
+    // The QRhi of the drawing context: the decoder's texture converters map their frames through one
+    bool ensureRhi(QString *why)
+    {
+        if (m_rhi)
+            return true;
+        if (m_rhiFailed) {
+            *why = m_rhiWhy;
+            return false;
+        }
+        QRhiGles2InitParams params;
+        params.fallbackSurface = m_surface.get();
+        params.format = m_context->format();
+        QRhiGles2NativeHandles handles;
+        handles.context = m_context.get();
+        m_rhi.reset(QRhi::create(QRhi::OpenGLES2, &params, QRhi::Flags(), &handles));
+        m_context->makeCurrent(m_surface.get());
+        if (!m_rhi) {
+            m_rhiFailed = true;
+            m_rhiWhy = QStringLiteral("a QRhi could not be made on the drawing context");
+            *why = m_rhiWhy;
+            return false;
+        }
+        return true;
+    }
+
+    // Whether a frame is one the decoder keeps on a GPU, and when it is (and the person did not ask for a copy), its planes as
+    // textures of this context. *hardware: the frame is a hardware frame (its read back is a copy to system memory).
+    bool importFrame(QHwVideoBuffer *hw, const QSize &size, int bytes, bool copyAsked, bool *hardware, QString *why)
+    {
+        *hardware = false;
+        m_imp = {};
+        if (!ensureRhi(why))
+            return false;
+        hw->initTextureConverter(*m_rhi);
+        if (hw->handleType() != QVideoFrame::RhiTextureHandle)
+            return false; // a frame in system memory: nothing to import, nothing said
+        *hardware = true;
+        if (copyAsked) {
+            *why = QStringLiteral("the copy to system memory was asked for");
+            return false;
+        }
+        QVideoFrameTexturesUPtr textures = hw->mapTextures(*m_rhi, m_oldTextures);
+        m_context->makeCurrent(m_surface.get());
+        if (!textures) {
+            *why = QStringLiteral("the decoder's texture converter refused the frame (the DMA-BUF of the decoding GPU cannot be "
+                                  "imported by this GPU)");
+            return false;
+        }
+        QRhiTexture *ty = textures->texture(0), *tuv = textures->texture(1);
+        if (!ty || !tuv) {
+            *why = QStringLiteral("the frame has no two planes (luma and interleaved chroma)");
+            return false;
+        }
+        const QRhiTexture::Format fy = bytes == 2 ? QRhiTexture::R16 : QRhiTexture::R8;
+        const QRhiTexture::Format fuv = bytes == 2 ? QRhiTexture::RG16 : QRhiTexture::RG8;
+        if (ty->format() != fy || tuv->format() != fuv) {
+            *why = QStringLiteral("the planes are textures of a format the passes do not read (%1, %2)")
+                           .arg(int(ty->format())).arg(int(tuv->format()));
+            return false;
+        }
+        if ((ty->flags() & QRhiTexture::ExternalOES) || (tuv->flags() & QRhiTexture::ExternalOES)) {
+            *why = QStringLiteral("the planes are external (OES) textures");
+            return false;
+        }
+        if (ty->pixelSize() != size) {
+            *why = QStringLiteral("the luma texture is %1x%2, the frame %3x%4").arg(ty->pixelSize().width())
+                           .arg(ty->pixelSize().height()).arg(size.width()).arg(size.height());
+            return false;
+        }
+        const quint64 gy = ty->nativeTexture().object, guv = tuv->nativeTexture().object;
+        if (!gy || !guv) {
+            *why = QStringLiteral("the planes have no OpenGL texture");
+            return false;
+        }
+        m_imp.y = unsigned(gy);
+        m_imp.uv = unsigned(guv);
+        m_imp.textures = std::move(textures);
+        m_imp.on = true;
+        m_importBase = kImportedBase;
+        m_importStride = ptrdiff_t(size.width()) * bytes;
+        m_importBytes = bytes;
+        return true;
+    }
+
+    // After the drawing: the frame's textures wait for the next one (the converter reuses them) and the frame is let go
+    void releaseImport()
+    {
+        if (m_imp.on)
+            m_oldTextures = std::move(m_imp.textures);
+        m_imp = {};
+    }
+
     bool makeCurrent()
     {
         g_depthContext = m_context.get();
@@ -603,6 +802,22 @@ public:
             m_context->doneCurrent();
     }
     stereo_dibr_gl *gl() const { return m_gl; }
+    // What the driver says is free, with what this drawer holds put back: the memory a way may use, as the controls and the guard of the
+    // automatic choice judge it
+    double freeMemory() const
+    {
+        if (!m_gl)
+            return -1;
+        const double free = stereo_dibr_gl_free_memory(m_gl);
+        if (free < 0)
+            return -1;
+        double held = stereo_dibr_gl_memory_used(m_gl);
+        for (const Tex &t : m_tex) {
+            const int bpp = t.internal == GL_RGBA16_ ? 8 : (t.internal == GL_RGBA8_ || t.internal == GL_RG16_) ? 4 : (t.internal == GL_RG8_ || t.internal == GL_R16_ || t.internal == GL_R16UI_) ? 2 : 1;
+            held += double(t.w) * t.h * bpp;
+        }
+        return free + held;
+    }
     bool lost() const { return m_lost; }
     bool isEs() const { return m_context && m_context->isOpenGLES(); }
 
@@ -610,11 +825,19 @@ public:
     // width), in the current context. parts are the picture and its depth map (stereo_dibr_unpack()
     // of the frame, turned as the frame asks), dparts the same for the depth component of the
     // frame. Returns false with the reason.
-    bool draw(Source source, bool fullRange, int colorSpace, const stereo_dibr_parts &parts,
-              const stereo_dibr_parts &dparts, const stereo_dibr_params &prm, const float *table,
-              int tableSize, const float *layerTable, QVideoFrame *result, QString *why)
+    bool draw(Source source, const Deep &deep, bool fullRange, int colorSpace,
+              const stereo_dibr_parts &parts, const stereo_dibr_parts &dparts,
+              const stereo_dibr_params &prm, const float *table, int tableSize,
+              const float *layerTable, QVideoFrame *result, QString *why)
     {
         const int vw = parts.picture.width, vh = parts.picture.height;
+        if (deep.on && !m_deepOk) {
+            *why = QStringLiteral("this OpenGL ES has no GL_EXT_texture_norm16: the 16 bit planes have no texture format");
+            return false;
+        }
+        m_deep = deep;
+        // the colour textures of the passes never hold less than the source
+        stereo_dibr_gl_set_precision(m_gl, deep.on ? deep.precision : 8);
         while (m_f->glGetError() != 0) { }
         if (!picture(source, fullRange, colorSpace, parts.picture, Pic) ||
             !depth(source, dparts.depth, Depth)) {
@@ -628,20 +851,23 @@ public:
             *why = QStringLiteral("a layer could not be uploaded");
             return false;
         }
-        makeTexture(Target, vw * 2, vh, GL_RGBA8_, GL_RGBA_);
+        if (deep.on)
+            makeTexture(Target, vw * 2, vh, GL_RGBA16_, GL_RGBA_, GL_UNSIGNED_SHORT_);
+        else
+            makeTexture(Target, vw * 2, vh, GL_RGBA8_, GL_RGBA_);
         const float hole[4] = { 0.f, 0.f, 0.f, 1.f };
         int r;
         if (layered)
             r = stereo_dibr_gl_render_layer(m_gl, &prm, table, tableSize, m_tex[Pic].id, vw, vh,
                                             m_tex[Depth].id, dparts.depth.width,
-                                            dparts.depth.height, 0, parts.layer_role,
+                                            dparts.depth.height, deep.on ? 1 : 0, parts.layer_role,
                                             m_tex[LayerPic].id, layerTable, tableSize,
                                             m_tex[LayerDepth].id, dparts.layer_depth.width,
                                             dparts.layer_depth.height, m_tex[Target].id, hole);
         else
             r = stereo_dibr_gl_render(m_gl, &prm, table, tableSize, m_tex[Pic].id, vw, vh,
-                                      m_tex[Depth].id, dparts.depth.width, dparts.depth.height, 0,
-                                      m_tex[Target].id, hole);
+                                      m_tex[Depth].id, dparts.depth.width, dparts.depth.height,
+                                      deep.on ? 1 : 0, m_tex[Target].id, hole);
         if (r < 0) {
             if (r == -4 || stereo_dibr_gl_reset_status(m_gl))
                 m_lost = true;
@@ -650,6 +876,8 @@ public:
                 *why = QStringLiteral("the views could not be drawn");
             return false;
         }
+        if (deep.on)
+            return encodeViews(fullRange, colorSpace, vw, vh, result, why);
         // the views into the frame
         m_f->glBindFramebuffer(GL_FRAMEBUFFER_, m_fbo);
         m_f->glFramebufferTexture2D(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D_,
@@ -666,7 +894,7 @@ public:
     }
 
 private:
-    enum TexId { Y, U, V, Raw, Pic, Depth, Target, LayerPic, LayerDepth, NbTextures };
+    enum TexId { Y, U, V, Raw, Pic, Depth, Target, LayerPic, LayerDepth, OutY, OutU, OutV, NbTextures };
     struct Tex
     {
         unsigned id = 0;
@@ -700,11 +928,21 @@ private:
                 m_f->glDeleteProgram(m_convert);
             if (m_channel)
                 m_f->glDeleteProgram(m_channel);
+            if (m_encode)
+                m_f->glDeleteProgram(m_encode);
+            if (m_luma)
+                m_f->glDeleteProgram(m_luma);
+            if (m_lumaInt)
+                m_f->glDeleteProgram(m_lumaInt);
+            m_imp = {};
+            m_oldTextures.reset();
+            m_rhi.reset();
             m_context->doneCurrent();
         }
         m_gl = nullptr;
         m_tex = {};
-        m_vao = m_fbo = m_convert = m_channel = 0;
+        m_vao = m_fbo = m_convert = m_channel = m_encode = m_luma = m_lumaInt = 0;
+        m_rhiFailed = false;
         m_surface.reset();
         m_context.reset();
         m_f = nullptr;
@@ -758,18 +996,21 @@ private:
     {
         m_convert = program(kConvert);
         m_channel = program(kChannel);
-        return m_convert && m_channel;
+        m_encode = program(kEncode);
+        m_luma = program(kLuma);
+        m_lumaInt = program(kLumaInt);
+        return m_convert && m_channel && m_encode && m_luma && m_lumaInt;
     }
 
-    void makeTexture(TexId id, int w, int h, unsigned internal, unsigned format)
+    void makeTexture(TexId id, int w, int h, unsigned internal, unsigned format,
+                     unsigned type = GL_UNSIGNED_BYTE_)
     {
         Tex &t = m_tex[id];
         if (!t.id)
             m_f->glGenTextures(1, &t.id);
         m_f->glBindTexture(GL_TEXTURE_2D_, t.id);
         if (t.w != w || t.h != h || t.internal != internal) {
-            m_f->glTexImage2D(GL_TEXTURE_2D_, 0, int(internal), w, h, 0, format, GL_UNSIGNED_BYTE_,
-                              nullptr);
+            m_f->glTexImage2D(GL_TEXTURE_2D_, 0, int(internal), w, h, 0, format, type, nullptr);
             m_f->glTexParameteri(GL_TEXTURE_2D_, 0x2801 /* MIN_FILTER */, 0x2600 /* NEAREST */);
             m_f->glTexParameteri(GL_TEXTURE_2D_, 0x2800 /* MAG_FILTER */, 0x2600);
             m_f->glTexParameteri(GL_TEXTURE_2D_, 0x2802 /* WRAP_S */, 0x812F /* CLAMP_TO_EDGE */);
@@ -804,6 +1045,105 @@ private:
         return true;
     }
 
+    // A plane of 16 bit samples (1 or 2 channels), the words as they are: R16 / RG16, or R16UI for the depth samples
+    bool uploadWords(TexId id, int w, int h, int channels, bool integer, const void *data,
+                     ptrdiff_t stride)
+    {
+        const int bpp = 2 * channels;
+        if (!data || stride <= 0 || w <= 0 || h <= 0)
+            return false;
+        const unsigned internal = integer ? GL_R16UI_ : channels == 1 ? GL_R16_ : GL_RG16_;
+        const unsigned format = integer ? GL_RED_INTEGER_ : channels == 1 ? GL_RED_ : GL_RG_;
+        makeTexture(id, w, h, internal, format, GL_UNSIGNED_SHORT_);
+        m_f->glPixelStorei(0x0CF5 /* GL_UNPACK_ALIGNMENT */, 1);
+        if (stride % bpp == 0) {
+            m_f->glPixelStorei(GL_UNPACK_ROW_LENGTH_, int(stride / bpp));
+            m_f->glTexSubImage2D(GL_TEXTURE_2D_, 0, 0, 0, w, h, format, GL_UNSIGNED_SHORT_, data);
+            m_f->glPixelStorei(GL_UNPACK_ROW_LENGTH_, 0);
+        } else {
+            std::vector<uint8_t> rows(size_t(w) * bpp * h);
+            for (int y = 0; y < h; ++y)
+                std::memcpy(rows.data() + size_t(y) * w * bpp,
+                            static_cast<const uint8_t *>(data) + y * stride, size_t(w) * bpp);
+            m_f->glTexSubImage2D(GL_TEXTURE_2D_, 0, 0, 0, w, h, format, GL_UNSIGNED_SHORT_, rows.data());
+        }
+        return true;
+    }
+
+    // A plane of the output at the source's depth, read back into the frame's plane
+    bool readPlane(TexId id, int w, int h, int channels, uchar *dst, int strideBytes)
+    {
+        m_f->glBindFramebuffer(GL_FRAMEBUFFER_, m_fbo);
+        m_f->glFramebufferTexture2D(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D_, m_tex[id].id, 0);
+        if (m_f->glCheckFramebufferStatus(GL_FRAMEBUFFER_) != GL_FRAMEBUFFER_COMPLETE_)
+            return false;
+        m_f->glPixelStorei(0x0D05 /* GL_PACK_ALIGNMENT */, 1);
+        m_f->glPixelStorei(GL_PACK_ROW_LENGTH_, strideBytes / (2 * channels));
+        m_f->glReadPixels(0, 0, w, h, channels == 1 ? GL_RED_ : GL_RG_, GL_UNSIGNED_SHORT_, dst);
+        m_f->glPixelStorei(GL_PACK_ROW_LENGTH_, 0);
+        return m_f->glGetError() == 0;
+    }
+
+    void kForMatrix(int colorSpace, float *kr, float *kb)
+    {
+        *kr = 0.299f;
+        *kb = 0.114f;
+        if (colorSpace == 1) {
+            *kr = 0.2126f;
+            *kb = 0.0722f;
+        } else if (colorSpace == 2) {
+            *kr = 0.2627f;
+            *kb = 0.0593f;
+        }
+    }
+
+    // The planes of the views at the source's depth, into the frame (result, the source's pixel format)
+    bool encodeViews(bool fullRange, int colorSpace, int vw, int vh, QVideoFrame *result, QString *why)
+    {
+        float kr, kb;
+        kForMatrix(colorSpace, &kr, &kb);
+        const int tw = vw * 2;
+        auto run = [&](int plane, TexId out, int w, int h, int channels) {
+            makeTexture(out, w, h, channels == 1 ? GL_R16_ : GL_RG16_, channels == 1 ? GL_RED_ : GL_RG_,
+                        GL_UNSIGNED_SHORT_);
+            m_f->glUseProgram(m_encode);
+            bindTexture(0, Target, m_encode, "u_target");
+            auto u = [&](const char *n) { return m_f->glGetUniformLocation(m_encode, n); };
+            m_f->glUniform1i(u("u_plane"), plane);
+            m_f->glUniform2i(u("u_shift"), m_deep.log2w, m_deep.log2h);
+            m_f->glUniform2i(u("u_size"), tw, vh);
+            m_f->glUniform2f(u("u_k"), kr, kb);
+            m_f->glUniform1i(u("u_full"), fullRange ? 1 : 0);
+            m_f->glUniform1f(u("u_div"), m_deep.div);
+            m_f->glUniform1f(u("u_max"), m_deep.max);
+            m_f->glUniform1f(u("u_mid"), m_deep.mid);
+            pass(m_encode, out, w, h);
+        };
+        run(0, OutY, tw, vh, 1);
+        if (!readPlane(OutY, tw, vh, 1, result->bits(0), result->bytesPerLine(0))) {
+            *why = QStringLiteral("the luma of the views could not be read back");
+            return false;
+        }
+        const int cw = (tw + (1 << m_deep.log2w) - 1) >> m_deep.log2w;
+        const int ch = (vh + (1 << m_deep.log2h) - 1) >> m_deep.log2h;
+        if (m_deep.semi) {
+            run(3, OutU, cw, ch, 2);
+            if (!readPlane(OutU, cw, ch, 2, result->bits(1), result->bytesPerLine(1))) {
+                *why = QStringLiteral("the chroma of the views could not be read back");
+                return false;
+            }
+        } else {
+            run(1, OutU, cw, ch, 1);
+            run(2, OutV, cw, ch, 1);
+            if (!readPlane(OutU, cw, ch, 1, result->bits(1), result->bytesPerLine(1))
+                || !readPlane(OutV, cw, ch, 1, result->bits(2), result->bytesPerLine(2))) {
+                *why = QStringLiteral("the chroma of the views could not be read back");
+                return false;
+            }
+        }
+        return true;
+    }
+
     void pass(unsigned prog, TexId out, int w, int h)
     {
         m_f->glBindFramebuffer(GL_FRAMEBUFFER_, m_fbo);
@@ -824,6 +1164,25 @@ private:
         m_f->glUniform1i(m_f->glGetUniformLocation(prog, name), unit);
     }
 
+    // Where a picture of the frame starts in its planes, from the pointers stereo_dibr_unpack() made of the frame's layout
+    bool originOf(const void *p, int *x, int *y) const
+    {
+        const uintptr_t off = uintptr_t(p) - m_importBase;
+        const ptrdiff_t stride = m_importStride, bytes = m_importBytes;
+        if (stride <= 0 || bytes <= 0 || uintptr_t(p) < m_importBase)
+            return false;
+        *y = int(off / uintptr_t(stride));
+        *x = int((off % uintptr_t(stride)) / uintptr_t(bytes));
+        return true;
+    }
+
+    void bindExternal(int unit, unsigned id, unsigned prog, const char *name)
+    {
+        m_f->glActiveTexture(0x84C0 + unit);
+        m_f->glBindTexture(GL_TEXTURE_2D_, id);
+        m_f->glUniform1i(m_f->glGetUniformLocation(prog, name), unit);
+    }
+
     // One picture (or layer) of a frame into the RGBA texture out
     bool picture(Source source, bool fullRange, int colorSpace, const stereo_dibr_picture &pic,
                  TexId out)
@@ -834,20 +1193,48 @@ private:
         const stereo_dibr_plane &py = pic.plane[0], &pu = pic.plane[1];
         const int cw = (w + (1 << pu.log2_w) - 1) >> pu.log2_w;
         const int ch = (h + (1 << pu.log2_h) - 1) >> pu.log2_h;
-        if (!upload(Y, w, h, 1, py.data, py.stride))
-            return false;
-        if (source == Source::Planar) {
-            const stereo_dibr_plane &pv = pic.plane[2];
-            if (!upload(U, cw, ch, 1, pu.data, pu.stride) || !upload(V, cw, ch, 1, pv.data, pv.stride))
+        int ox = 0, oy = 0;
+        if (m_imp.on) {
+            // the decoder's planes, read where they are: the picture's place in them is the offset of its pointer
+            if (!originOf(py.data, &ox, &oy) || ((ox | oy) & 1))
                 return false;
-        } else if (!upload(U, cw, ch, 2, pu.data, pu.stride)) {
-            return false;
+        } else if (m_deep.on) {
+            if (!uploadWords(Y, w, h, 1, false, py.data, py.stride))
+                return false;
+            if (source == Source::Planar) {
+                const stereo_dibr_plane &pv = pic.plane[2];
+                if (!uploadWords(U, cw, ch, 1, false, pu.data, pu.stride)
+                    || !uploadWords(V, cw, ch, 1, false, pv.data, pv.stride))
+                    return false;
+            } else if (!uploadWords(U, cw, ch, 2, false, pu.data, pu.stride)) {
+                return false;
+            }
+        } else {
+            if (!upload(Y, w, h, 1, py.data, py.stride))
+                return false;
+            if (source == Source::Planar) {
+                const stereo_dibr_plane &pv = pic.plane[2];
+                if (!upload(U, cw, ch, 1, pu.data, pu.stride) || !upload(V, cw, ch, 1, pv.data, pv.stride))
+                    return false;
+            } else if (!upload(U, cw, ch, 2, pu.data, pu.stride)) {
+                return false;
+            }
         }
-        makeTexture(out, w, h, GL_RGBA8_, GL_RGBA_);
+        if (m_deep.on)
+            makeTexture(out, w, h, GL_RGBA16_, GL_RGBA_, GL_UNSIGNED_SHORT_);
+        else
+            makeTexture(out, w, h, GL_RGBA8_, GL_RGBA_);
         m_f->glUseProgram(m_convert);
-        bindTexture(0, Y, m_convert, "u_y");
-        bindTexture(1, U, m_convert, "u_u");
-        bindTexture(2, source == Source::Planar ? V : U, m_convert, "u_v");
+        if (m_imp.on) {
+            bindExternal(0, m_imp.y, m_convert, "u_y");
+            bindExternal(1, m_imp.uv, m_convert, "u_u");
+            bindExternal(2, m_imp.uv, m_convert, "u_v");
+        } else {
+            bindTexture(0, Y, m_convert, "u_y");
+            bindTexture(1, U, m_convert, "u_u");
+            bindTexture(2, source == Source::Planar ? V : U, m_convert, "u_v");
+        }
+        m_f->glUniform2i(m_f->glGetUniformLocation(m_convert, "u_origin"), ox, oy);
         m_f->glUniform1i(m_f->glGetUniformLocation(m_convert, "u_mode"),
                          source == Source::Planar ? 0 : source == Source::SemiUV ? 1 : 2);
         m_f->glUniform2i(m_f->glGetUniformLocation(m_convert, "u_shift"), pu.log2_w, pu.log2_h);
@@ -861,7 +1248,12 @@ private:
         }
         m_f->glUniform2f(m_f->glGetUniformLocation(m_convert, "u_k"), kr, kb);
         m_f->glUniform1i(m_f->glGetUniformLocation(m_convert, "u_full"), fullRange ? 1 : 0);
+        m_f->glUniform1f(m_f->glGetUniformLocation(m_convert, "u_scale"), m_deep.on ? 65535.f : 255.f);
+        m_f->glUniform1f(m_f->glGetUniformLocation(m_convert, "u_div"), m_deep.on ? m_deep.div : 1.f);
+        m_f->glUniform1f(m_f->glGetUniformLocation(m_convert, "u_max"), m_deep.on ? m_deep.max : 255.f);
+        m_f->glUniform1f(m_f->glGetUniformLocation(m_convert, "u_mid"), m_deep.on ? m_deep.mid : 128.f);
         pass(m_convert, out, w, h);
+        m_f->glUniform2i(m_f->glGetUniformLocation(m_convert, "u_origin"), 0, 0);
         return true;
     }
 
@@ -878,6 +1270,24 @@ private:
             pass(m_channel, out, d.width, d.height);
             return true;
         }
+        if (m_imp.on) {
+            // the luma of the decoder's frame, where it is, into the texture the passes read
+            int ox = 0, oy = 0;
+            if (!originOf(d.data, &ox, &oy))
+                return false;
+            if (m_deep.on)
+                makeTexture(out, d.width, d.height, GL_R16UI_, GL_RED_INTEGER_, GL_UNSIGNED_SHORT_);
+            else
+                makeTexture(out, d.width, d.height, GL_R8_, GL_RED_);
+            const unsigned prog = m_deep.on ? m_lumaInt : m_luma;
+            m_f->glUseProgram(prog);
+            bindExternal(0, m_imp.y, prog, "u_y");
+            m_f->glUniform2i(m_f->glGetUniformLocation(prog, "u_origin"), ox, oy);
+            pass(prog, out, d.width, d.height);
+            return true;
+        }
+        if (m_deep.on)
+            return d.bytes == 2 && uploadWords(out, d.width, d.height, 1, true, d.data, d.stride);
         if (d.bytes != 1)
             return false;
         return upload(out, d.width, d.height, 1, d.data, d.stride);
@@ -892,8 +1302,18 @@ private:
     QThread m_worker;
     QObject m_executor;
     std::array<Tex, NbTextures> m_tex;
-    unsigned m_vao = 0, m_fbo = 0, m_convert = 0, m_channel = 0;
+    unsigned m_vao = 0, m_fbo = 0, m_convert = 0, m_channel = 0, m_encode = 0;
     bool m_lost = false;
+    bool m_deepOk = true;
+    Deep m_deep;
+    std::unique_ptr<QRhi> m_rhi;
+    bool m_rhiFailed = false;
+    QString m_rhiWhy;
+    Imported m_imp;
+    QVideoFrameTexturesUPtr m_oldTextures;
+    unsigned m_luma = 0, m_lumaInt = 0;
+    uintptr_t m_importBase = 0;
+    ptrdiff_t m_importStride = 0, m_importBytes = 1;
 };
 
 #endif // QT_MM_DEPTH_GPU
@@ -913,6 +1333,13 @@ struct Renderer::Private
     // what the automatic way chose for the last frame, and where it was drawn
     Choice choice;
     bool onGpu = false;
+    // the route of the last frame the decoder keeps on a GPU, and what it cost
+    FrameRoute route = FrameRoute::Memory;
+    QString routeWhy;
+    int hwReadBacks = 0;
+    bool importLive = false;
+    GpuMemory gpuMem;
+    int memoryFrames = 0;
     // the times of the ways on the engine that draws, for the size drawn
     struct Timing
     {
@@ -1051,8 +1478,37 @@ namespace {
 // The pixel formats the GPU reads as they are: 8 bit planar and semi-planar YUV, and RGBA as
 // stored (the frames of hardware decoders and of other formats arrive as RGBA 8 bit images)
 #ifdef QT_MM_DEPTH_GPU
-bool gpuSourceOf(PixelFormat format, GpuDrawer::Source *source)
+bool gpuSourceOf(PixelFormat format, const Layout &l, GpuDrawer::Source *source, GpuDrawer::Deep *deep)
 {
+    *deep = {};
+    if (l.bits > 8) {
+        // 10, 12 and 16 bit samples as the words they are: P010 and P016 hold the code in the high bits (the 16 bit word is
+        // the 8 bit code times 256 and more), YUV420P10 in the low bits
+        deep->on = true;
+        deep->tableBits = l.bits;
+        deep->log2w = l.c[1].log2w;
+        deep->log2h = l.c[1].log2h;
+        deep->semi = l.semiPlanar;
+        switch (format) {
+        case PixelFormat::Format_YUV420P10:
+            deep->precision = 10;
+            deep->div = 4;
+            deep->max = 1023;
+            deep->mid = 512;
+            break;
+        case PixelFormat::Format_P010:
+            deep->precision = 10;
+            break;
+        case PixelFormat::Format_P016:
+        case PixelFormat::Format_YUV422P16:
+        case PixelFormat::Format_YUV444P16:
+            break;
+        default:
+            return false;
+        }
+        *source = l.semiPlanar ? GpuDrawer::Source::SemiUV : GpuDrawer::Source::Planar;
+        return true;
+    }
     switch (format) {
     case PixelFormat::Format_YUV420P:
     case PixelFormat::Format_YV12:
@@ -1106,29 +1562,105 @@ Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, M
         if (!layoutOf(frame.pixelFormat(), &l))
             return Outcome::Failed;
     }
+    bool deepGpu = false; // the GPU draws a source of more than 8 bits at its depth
 #ifdef QT_MM_DEPTH_GPU
     GpuDrawer::Source source = GpuDrawer::Source::Planar;
-    if (useGpu && (l.bits != 8 || !gpuSourceOf(frame.pixelFormat(), &source))) {
+    GpuDrawer::Deep deep;
+    if (useGpu && !gpuSourceOf(frame.pixelFormat(), l, &source, &deep)) {
         *why = QStringLiteral("the pixel format %1 is not one the GPU reads")
                        .arg(QVideoFrameFormat::pixelFormatToString(frame.pixelFormat()));
         return Outcome::GpuFailed;
     }
+    deepGpu = useGpu && deep.on;
 #else
     Q_UNUSED(why);
     if (useGpu)
         return Outcome::GpuFailed;
 #endif
-    if (!frame.map(QVideoFrame::ReadOnly))
-        return Outcome::Failed;
+    // A frame the decoder keeps on a GPU (VA-API) is read where it is, by the passes of the drawing context, when the decoder's
+    // texture converter can map it there: no read back to system memory. Otherwise it is copied, and the log says why.
+    bool imported = false;
+    route = FrameRoute::Memory;
+    routeWhy.clear();
+#ifdef QT_MM_DEPTH_GPU
+    if (importLive) {
+        // a frame imported earlier and not drawn (the draw stopped before the passes): let it go
+        gpu.run([&] { gpu.makeCurrent(); gpu.releaseImport(); gpu.doneCurrent(); });
+        importLive = false;
+    }
+    if (useGpu) {
+        if (QHwVideoBuffer *hw = QVideoFramePrivate::hwBuffer(input)) {
+            const VideoTransformation turn = qNormalizedFrameTransformation(input);
+            bool hardware = false;
+            QString reason;
+            bool ok = false;
+            if (turn.rotation != QtVideo::Rotation::None || turn.mirroredHorizontallyAfterRotation) {
+                // the pictures of a turned frame are turned on the processor's copy
+                bool dummy = false;
+                gpu.run([&] { ok = gpu.makeCurrent() && gpu.importFrame(hw, QSize(), 1, true, &dummy, &reason); gpu.doneCurrent(); });
+                hardware = dummy;
+                reason = QStringLiteral("the frame is turned (rotated or mirrored)");
+            } else if (!l.semiPlanar || source != GpuDrawer::Source::SemiUV) {
+                bool dummy = false;
+                gpu.run([&] { ok = gpu.makeCurrent() && gpu.importFrame(hw, QSize(), 1, true, &dummy, &reason); gpu.doneCurrent(); });
+                hardware = dummy;
+                reason = QStringLiteral("the frame's planes are not luma and interleaved chroma");
+            } else {
+                gpu.run([&] {
+                    ok = gpu.makeCurrent()
+                            && gpu.importFrame(hw, frame.size(), l.bytes, !options.importFrames, &hardware, &reason);
+                    gpu.doneCurrent();
+                });
+            }
+            if (ok) {
+                imported = true;
+                importLive = true;
+                route = FrameRoute::Imported;
+                say(QStringLiteral("hardware frames of the decoder are read by the drawing passes where they are, no read back to "
+                                   "system memory (mapped through the decoder's texture converter)"),
+                    false);
+            } else if (hardware) {
+                route = FrameRoute::Copied;
+                routeWhy = reason;
+                say(QStringLiteral("hardware frames of the decoder are copied to system memory: %1").arg(reason), false);
+            }
+        }
+    }
+#endif
+    auto unmapFrame = [&] {
+        if (!imported)
+            frame.unmap();
+    };
+    if (!imported) {
+        // the copy to system memory: a hardware frame is read back by the decoder's map()
+        QHwVideoBuffer *hw = QVideoFramePrivate::hwBuffer(input);
+        if (hw && hw->handleType() == QVideoFrame::RhiTextureHandle) {
+            if (route != FrameRoute::Copied) {
+                route = FrameRoute::Copied;
+                routeWhy = useGpu ? QStringLiteral("the frame was not imported") : QStringLiteral("the views are drawn on the processor");
+            }
+            ++hwReadBacks;
+        }
+        if (!frame.map(QVideoFrame::ReadOnly))
+            return Outcome::Failed;
+    }
 
     const int w = frame.width(), h = frame.height();
     const bool fullRange = frame.surfaceFormat().colorRange() == QVideoFrameFormat::ColorRange_Full
             || l.c[0].kind == Component::Color;
     uchar *inBits[4] = {};
     int inStrides[4] = {};
-    for (int p = 0; p < frame.planeCount() && p < 4; ++p) {
-        inBits[p] = const_cast<uchar *>(frame.bits(p));
-        inStrides[p] = frame.bytesPerLine(p);
+    if (imported) {
+        // no pointers into memory: the layout's offsets, for stereo_dibr_unpack() to place the pictures
+        for (int p = 0; p < (l.semiPlanar ? 2 : 3); ++p) {
+            inBits[p] = reinterpret_cast<uchar *>(kImportedBase + (uintptr_t(p) << 36));
+            inStrides[p] = w * l.bytes;
+        }
+    } else {
+        for (int p = 0; p < frame.planeCount() && p < 4; ++p) {
+            inBits[p] = const_cast<uchar *>(frame.bits(p));
+            inStrides[p] = frame.bytesPerLine(p);
+        }
     }
     std::vector<PlaneData> inPlanes;
     stereo_dibr_picture whole;
@@ -1141,14 +1673,14 @@ Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, M
         whole.plane[0] = { inBits[0], inStrides[0], l.bytes, 0, 0, 0 };
         if (l.semiPlanar) {
             whole.nb_planes = 2;
-            whole.plane[1] = { inBits[1], inStrides[1], 2, 1, 1, 0 };
+            whole.plane[1] = { inBits[1], inStrides[1], 2 * l.bytes, 1, 1, 0 };
         } else if (l.c[0].kind == Component::Color) {
             whole.nb_planes = 1;
             whole.plane[0].bytes = 4;
         } else {
             whole.nb_planes = 3;
             for (int c = 1; c < 3; ++c)
-                whole.plane[c] = { inBits[l.c[c].plane], inStrides[l.c[c].plane], 1,
+                whole.plane[c] = { inBits[l.c[c].plane], inStrides[l.c[c].plane], l.bytes,
                                    l.c[c].log2w, l.c[c].log2h, 0 };
         }
         depthWhole = whole;
@@ -1166,7 +1698,7 @@ Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, M
     stereo_dibr_parts parts, depthParts;
     if (stereo_dibr_unpack(&whole, packing, depthFirst, 0, &parts) < 0
         || stereo_dibr_unpack(&depthWhole, packing, depthFirst, 0, &depthParts) < 0) {
-        frame.unmap();
+        unmapFrame();
         return Outcome::Failed;
     }
 
@@ -1191,13 +1723,13 @@ Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, M
     stereo_depth_convention c;
     const int known = convention(fileMark, options, l.bits, &c);
     if (known <= 0) {
-        frame.unmap();
+        unmapFrame();
         return known == 0 ? Outcome::PictureAlone : Outcome::Failed;
     }
     const size_t tableSize = size_t(1) << l.bits;
     table.resize(tableSize);
     if (stereo_depth_parallax_table(&c, vw, table.data()) < 0) {
-        frame.unmap();
+        unmapFrame();
         return Outcome::Failed;
     }
     layerTable.clear();
@@ -1209,7 +1741,7 @@ Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, M
 
     // the output: the views at the picture's size, side by side
     QVideoFrameFormat format = frame.surfaceFormat();
-    if (useGpu) {
+    if (useGpu && !deepGpu) {
         // RGBA 8 bit, drawn by the GPU
         const QVideoFrameFormat from = format;
         format = QVideoFrameFormat(QSize(2 * vw, vh), PixelFormat::Format_RGBA8888);
@@ -1235,7 +1767,7 @@ Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, M
     }
     QVideoFrame result(format);
     if (!result.map(QVideoFrame::WriteOnly)) {
-        frame.unmap();
+        unmapFrame();
         return Outcome::Failed;
     }
 
@@ -1259,12 +1791,15 @@ Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, M
             ok = gpu.makeCurrent();
             if (!ok)
                 reason = QStringLiteral("the OpenGL context could not be made current");
+            // the ways are timed (and judged against the GPU's memory) at the depth of the content
+            if (ok)
+                stereo_dibr_gl_set_precision(gpu.gl(), deep.on ? deep.precision : 8);
             if (ok && !chooseWay(options, true, vw, vh, fps, &prm.warp, &prm.fill)) {
                 ok = false;
                 reason = QStringLiteral("the ways of drawing could not be timed on the GPU");
             }
             if (ok)
-                ok = gpu.draw(source, fullRange,
+                ok = gpu.draw(source, deep, fullRange,
                               frame.surfaceFormat().colorSpace()
                                       == QVideoFrameFormat::ColorSpace_BT709
                                       ? 1
@@ -1274,10 +1809,20 @@ Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, M
                                               : 0,
                               parts, depthParts, prm, table.data(), int(tableSize),
                               layerTable.empty() ? nullptr : layerTable.data(), &result, &reason);
+            gpu.releaseImport();
+            if (ok && (!gpuMem.valid || gpuMem.width != vw || gpuMem.height != vh || memoryFrames++ % 600 == 0)) {
+                // the driver's free memory, once a size and every few seconds
+                gpuMem.valid = true;
+                gpuMem.freeBytes = gpu.freeMemory();
+                gpuMem.width = vw;
+                gpuMem.height = vh;
+                gpuMem.bits = deep.on ? deep.precision : 8;
+            }
             gpu.doneCurrent();
+            importLive = false;
         });
         result.unmap();
-        frame.unmap();
+        unmapFrame();
         if (!ok) {
             *why = reason;
             return Outcome::GpuFailed;
@@ -1315,7 +1860,7 @@ Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, M
 
     if (!chooseWay(options, false, vw, vh, fps, &prm.warp, &prm.fill)) {
         result.unmap();
-        frame.unmap();
+        unmapFrame();
         return Outcome::Failed;
     }
     int r;
@@ -1331,7 +1876,7 @@ Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, M
     for (int cc = 0; cc < l.count; ++cc)
         putComponent(outBits, outStrides, l, cc, 2 * vw, vh, outPlanes[cc]);
     result.unmap();
-    frame.unmap();
+    unmapFrame();
     if (r < 0)
         return Outcome::Failed;
     onGpu = false;
@@ -1356,6 +1901,26 @@ Choice Renderer::choice() const
 bool Renderer::lastOnGpu() const
 {
     return d->onGpu;
+}
+
+Renderer::FrameRoute Renderer::lastFrameRoute() const
+{
+    return d->route;
+}
+
+GpuMemory Renderer::gpuMemory() const
+{
+    return d->onGpu ? d->gpuMem : GpuMemory();
+}
+
+QString Renderer::lastFrameRouteWhy() const
+{
+    return d->routeWhy;
+}
+
+int Renderer::hardwareReadBacks() const
+{
+    return d->hwReadBacks;
 }
 
 Renderer::Result Renderer::draw(const QVideoFrame &input, Mode mode, bool depthFirst,
@@ -1436,6 +2001,26 @@ Choice Renderer::choice() const
 bool Renderer::lastOnGpu() const
 {
     return false;
+}
+
+Renderer::FrameRoute Renderer::lastFrameRoute() const
+{
+    return FrameRoute::Memory;
+}
+
+GpuMemory Renderer::gpuMemory() const
+{
+    return {};
+}
+
+QString Renderer::lastFrameRouteWhy() const
+{
+    return {};
+}
+
+int Renderer::hardwareReadBacks() const
+{
+    return 0;
 }
 
 Renderer::Result Renderer::draw(const QVideoFrame &, Mode, bool, const QString &, const Options &,

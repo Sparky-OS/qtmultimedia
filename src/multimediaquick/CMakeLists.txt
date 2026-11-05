@@ -65,6 +65,8 @@ if(PkgConfig_FOUND)
     pkg_check_modules(STEREO_DIBR QUIET IMPORTED_TARGET stereo-dibr>=1.15.0)
 endif()
 if(STEREO_DIBR_FOUND)
+    # the QRhi that maps a hardware frame into the drawing context
+    target_link_libraries(MultimediaQuickPrivate PRIVATE Qt::GuiPrivate)
     target_compile_definitions(MultimediaQuickPrivate PRIVATE QT_MM_STEREO_DIBR)
     target_link_libraries(MultimediaQuickPrivate PRIVATE PkgConfig::STEREO_DIBR)
 endif()
