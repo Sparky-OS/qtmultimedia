@@ -12,6 +12,8 @@
 #include <QtMultimedia/private/qvideoframeconverter_p.h>
 #include <QtMultimediaQuick/private/qquickvideooutput_p.h>
 #include <QtMultimediaQuick/private/qquickvideostereo_p.h>
+#include <QtCore/qtemporarydir.h>
+#include <QtCore/qfileinfo.h>
 #include <QtMultimediaQuick/private/qquickvideodepth_p.h>
 #include <QtCore/qrandom.h>
 #include <QtGui/qguiapplication.h>
@@ -21,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 #include <set>
+#include <thread>
 
 using namespace QQuickVideoStereo;
 using Mode = QVideoFrameFormat::StereoMode;
@@ -71,6 +74,13 @@ private slots:
     void depthLayouts_data();
     void depthLayouts();
     void depthMarks();
+    void depthDefaultsAreTheLibrarys();
+    void depthWayIsAutomaticUntilPicked();
+    void depthChoiceIsTold();
+    void depthOnTheGpu();
+    void depthOnTheGpuFromSeveralThreads();
+    void depthOnTheGpuConvertsTheColour_data();
+    void depthOnTheGpuConvertsTheColour();
     void depthInVideoOutput();
     void depthRotated_data();
     void depthRotated();
@@ -393,7 +403,7 @@ namespace {
 // A frame of a depth layout, as a decoder gives it (YUV 4:4:4, full range): a picture of noise in
 // the luma, its depth map a constant 64 with a box of 160 (larger nearer); the graphics and the
 // background of their layouts, a band of depth 250 and a picture of depth 40.
-QVideoFrame depthFrame(Mode mode, bool depthFirst, int w, int h)
+QVideoFrame depthFrame(Mode mode, bool depthFirst, int w, int h, double fps = 0)
 {
     QRandomGenerator rng(151);
     QSize size(w, h);
@@ -415,6 +425,8 @@ QVideoFrame depthFrame(Mode mode, bool depthFirst, int w, int h)
     }
     QVideoFrameFormat format(size, QVideoFrameFormat::Format_YUV444P);
     format.setColorRange(QVideoFrameFormat::ColorRange_Full);
+    if (fps > 0)
+        format.setStreamFrameRate(fps);
     format.setStereoMode(mode);
     if (depthFirst)
         format.setStereoFlags(QVideoFrameFormat::StereoFlag::DepthFirst);
@@ -495,10 +507,46 @@ double shiftAt(const QVideoFrame &pair, int y, int x, int search)
     return bestDx;
 }
 
-double expectedParallax(const QString &mark, int sample, int width)
+// The shift of the green of row y around x from the left view to the right one of an RGBA pair
+double shiftAtRgba(const QVideoFrame &pair, int y, int x, int search)
+{
+    QVideoFrame f = pair;
+    if (!f.map(QVideoFrame::ReadOnly))
+        return qQNaN();
+    const int w = f.width() / 2, half = 4;
+    const uchar *p = f.bits(0);
+    const int stride = f.bytesPerLine(0);
+    double best = 1e30;
+    int bestDx = 0;
+    for (int dx = -search; dx <= search; ++dx) {
+        double cost = 0;
+        for (int yy = y - half; yy <= y + half; ++yy)
+            for (int xx = x - half; xx <= x + half; ++xx)
+                cost += std::abs(int(p[yy * stride + 4 * xx + 1])
+                                 - int(p[yy * stride + 4 * (w + xx + dx) + 1]));
+        if (cost < best) {
+            best = cost;
+            bestDx = dx;
+        }
+    }
+    f.unmap();
+    return bestDx;
+}
+
+// The way the views were drawn with when these tests were written, on the processor: forward warping,
+// background filling, no automatic choice (the geometry of the views does not depend on the way)
+QQuickVideoDepth::Options fixedWay()
 {
     QQuickVideoDepth::Options o;
-    Q_UNUSED(o);
+    o.automatic = false;
+    o.warp = 0;
+    o.fill = 0;
+    o.gpu = false;
+    return o;
+}
+
+double expectedParallax(const QString &mark, int sample, int width)
+{
     // nearness, the screen at 0.5 and 58 pixels at 1920 either side (libstereo-dibr)
     const double v = sample / 255.0;
     const double range = 58.0 * width / 1920.0;
@@ -531,7 +579,7 @@ void tst_QQuickVideoStereo::depthLayouts()
     QVERIFY(frame.isValid());
     QQuickVideoDepth::Renderer renderer;
     QVideoFrame pair;
-    QCOMPARE(renderer.draw(frame, Mode(mode), depthFirst, {}, {}, &pair),
+    QCOMPARE(renderer.draw(frame, Mode(mode), depthFirst, {}, fixedWay(), &pair),
              QQuickVideoDepth::Renderer::Result::Drawn);
     QCOMPARE(pair.size(), QSize(2 * w, h));
     QCOMPARE(pair.surfaceFormat().stereoMode(), Mode::SideBySide);
@@ -552,11 +600,11 @@ void tst_QQuickVideoStereo::depthMarks()
     QQuickVideoDepth::Renderer renderer;
     QVideoFrame pair;
     // the stream's mark: larger samples farther, so the box is behind the background
-    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, u"farness"_s, {}, &pair),
+    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, u"farness"_s, fixedWay(), &pair),
              QQuickVideoDepth::Renderer::Result::Drawn);
     QCOMPARE(shiftAt(pair, h / 2, w * 3 / 8, 12), -qRound(expectedParallax({}, 160, w)));
     // the user's meaning comes before it, and the user's mark before both
-    QQuickVideoDepth::Options o;
+    auto o = fixedWay();
     o.meaning = 0;
     QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, u"farness"_s, o, &pair),
              QQuickVideoDepth::Renderer::Result::Drawn);
@@ -569,8 +617,255 @@ void tst_QQuickVideoStereo::depthMarks()
     o.mark = u"nearness zero=abc"_s;
     QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, {}, o, &pair),
              QQuickVideoDepth::Renderer::Result::PictureAlone);
-    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, u"nearness zero=abc"_s, {}, &pair),
+    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, u"nearness zero=abc"_s, fixedWay(), &pair),
              QQuickVideoDepth::Renderer::Result::PictureAlone);
+}
+
+void tst_QQuickVideoStereo::depthDefaultsAreTheLibrarys()
+{
+    if (!QQuickVideoDepth::canDraw())
+        QSKIP("built without libstereo-dibr");
+    // the one default of libstereo-dibr (stereo_dibr_options_default()), which Options reads and holds no copy of: layered
+    // warping, depth-aided filling, 58 pixels, the screen in the middle, the way automatic, the GPU when it can
+    const QQuickVideoDepth::Options o;
+    QCOMPARE(o.view, 0);
+    QCOMPARE(o.warp, 2);
+    QCOMPARE(o.fill, 1);
+    QCOMPARE(o.smooth, 0);
+    QCOMPARE(o.radius, 5);
+    QCOMPARE(o.range, 58.0);
+    QCOMPARE(o.zero, 0.5);
+    QCOMPARE(o.shift, 0.0);
+    QVERIFY(o.automatic);
+    QVERIFY(o.gpu);
+    QQuickVideoOutput output;
+    QCOMPARE(int(output.stereoDepthWarp()), o.warp);
+    QCOMPARE(int(output.stereoDepthFill()), o.fill);
+    QCOMPARE(output.stereoDepthRange(), o.range);
+    QCOMPARE(output.stereoDepthRadius(), o.radius);
+    QVERIFY(output.stereoDepthAutomatic());
+    QVERIFY(output.stereoDepthGpu());
+    QVERIFY(output.stereoDepthChoice().isEmpty());
+}
+
+void tst_QQuickVideoStereo::depthWayIsAutomaticUntilPicked()
+{
+    if (!QQuickVideoDepth::canDraw())
+        QSKIP("built without libstereo-dibr");
+    QQuickVideoOutput output;
+    QSignalSpy automatic(&output, &QQuickVideoOutput::stereoDepthAutomaticChanged);
+    QSignalSpy fill(&output, &QQuickVideoOutput::stereoDepthFillChanged);
+    QVERIFY(output.stereoDepthAutomatic());
+    // picking a gap filling is picking the way, whatever it is
+    output.setStereoDepthFill(QQuickVideoOutput::StereoDepthFillPyramid);
+    QVERIFY(!output.stereoDepthAutomatic());
+    QCOMPARE(automatic.count(), 1);
+    QCOMPARE(fill.count(), 1);
+    QCOMPARE(output.stereoDepthFill(), QQuickVideoOutput::StereoDepthFillPyramid);
+    // the choice is given back
+    output.setStereoDepthAutomatic(true);
+    QVERIFY(output.stereoDepthAutomatic());
+    QCOMPARE(automatic.count(), 2);
+    // a warping picked, even the one it already has
+    output.setStereoDepthWarp(output.stereoDepthWarp());
+    QVERIFY(!output.stereoDepthAutomatic());
+    QCOMPARE(automatic.count(), 3);
+    // the same pick again changes nothing
+    output.setStereoDepthWarp(output.stereoDepthWarp());
+    QCOMPARE(automatic.count(), 3);
+}
+
+void tst_QQuickVideoStereo::depthChoiceIsTold()
+{
+    if (!QQuickVideoDepth::canDraw())
+        QSKIP("built without libstereo-dibr");
+    QTemporaryDir cache;
+    QVERIFY(cache.isValid());
+    qputenv("XDG_CACHE_HOME", cache.path().toLocal8Bit());
+    QQuickVideoOutput output;
+    QSignalSpy choice(&output, &QQuickVideoOutput::stereoDepthChoiceChanged);
+    const int w = 240, h = 136;
+    output.videoSink()->setVideoFrame(depthFrame(Mode::DepthSideBySide, false, w, h, 25));
+    QTRY_VERIFY(!output.stereoDepthChoice().isEmpty());
+    QVariantMap c = output.stereoDepthChoice();
+    // the way, whether it keeps up, what a frame may take at 25 frames a second (four fifths of 40 ms), and where it was drawn
+    QVERIFY(c.contains(u"warp"_s) && c.contains(u"fill"_s) && c.contains(u"keepsUp"_s) && c.contains(u"onGpu"_s));
+    QCOMPARE(c.value(u"fps"_s).toInt(), 25);
+    QCOMPARE(c.value(u"budgetMs"_s).toDouble(), 32.0);
+    QVERIFY(!c.value(u"gpu"_s).toString().isEmpty());
+    QTRY_VERIFY(choice.count() >= 1);
+    // the timing was kept in the person's cache, and in nothing else
+    QVERIFY(QFileInfo::exists(cache.path() + u"/stereo-dibr/timings"_s));
+    // the person picks the way: no choice is told
+    output.setStereoDepthWarp(QQuickVideoOutput::StereoDepthForward);
+    QTRY_VERIFY(output.stereoDepthChoice().isEmpty());
+    // and gives it back
+    output.setStereoDepthAutomatic(true);
+    QTRY_VERIFY(!output.stereoDepthChoice().isEmpty());
+    // the processor asked for: the C code, said
+    output.setStereoDepthGpu(false);
+    QTRY_COMPARE(output.stereoDepthChoice().value(u"onGpu"_s).toBool(), false);
+    // a video without depth tells nothing
+    QVideoFrameFormat plain(QSize(64, 48), QVideoFrameFormat::Format_YUV420P);
+    QVideoFrame frame(plain);
+    output.videoSink()->setVideoFrame(frame);
+    QTRY_VERIFY(output.stereoDepthChoice().isEmpty());
+    qunsetenv("XDG_CACHE_HOME");
+}
+
+void tst_QQuickVideoStereo::depthOnTheGpu()
+{
+    if (!QQuickVideoDepth::canDraw())
+        QSKIP("built without libstereo-dibr");
+    QTemporaryDir cache;
+    qputenv("XDG_CACHE_HOME", cache.path().toLocal8Bit());
+    const int w = 240, h = 136;
+    const QVideoFrame frame = depthFrame(Mode::DepthSideBySide, false, w, h);
+    auto o = fixedWay();
+    o.gpu = true;
+    QQuickVideoDepth::Renderer renderer;
+    QVideoFrame gpu;
+    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, {}, o, &gpu),
+             QQuickVideoDepth::Renderer::Result::Drawn);
+    if (!renderer.lastOnGpu())
+        QSKIP("no OpenGL context in this environment: the C code drew the views, and said so");
+    // RGBA 8 bit, full side by side, each view at the picture's size, the left eye first
+    QCOMPARE(gpu.pixelFormat(), QVideoFrameFormat::Format_RGBA8888);
+    QCOMPARE(gpu.size(), QSize(2 * w, h));
+    QCOMPARE(gpu.surfaceFormat().stereoMode(), Mode::SideBySide);
+    // the background (64) and the box (160) at their parallax, to the pixel, as on the processor
+    QCOMPARE(shiftAtRgba(gpu, h / 8, w * 3 / 4, 12), qRound(expectedParallax({}, 64, w)));
+    QCOMPARE(shiftAtRgba(gpu, h / 2, w * 3 / 8, 12), qRound(expectedParallax({}, 160, w)));
+    // the same views as the C code draws: the luma of its frame (the chroma is neutral) is the green of this one
+    o.gpu = false;
+    QVideoFrame cpu;
+    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, {}, o, &cpu),
+             QQuickVideoDepth::Renderer::Result::Drawn);
+    QVERIFY(!renderer.lastOnGpu());
+    QCOMPARE(cpu.pixelFormat(), QVideoFrameFormat::Format_YUV444P);
+    QVERIFY(gpu.map(QVideoFrame::ReadOnly));
+    QVERIFY(cpu.map(QVideoFrame::ReadOnly));
+    long far = 0, sum = 0;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < 2 * w; ++x) {
+            const int d = std::abs(int(gpu.bits(0)[y * gpu.bytesPerLine(0) + 4 * x + 1])
+                                   - int(cpu.bits(0)[y * cpu.bytesPerLine(0) + x]));
+            sum += d;
+            far += d > 2;
+        }
+    gpu.unmap();
+    cpu.unmap();
+    QVERIFY2(far * 500 < long(2 * w) * h, qPrintable(u"pixels off by more than 2: %1"_s.arg(far)));
+    QVERIFY2(sum < long(2 * w) * h / 4, qPrintable(u"sum of differences: %1"_s.arg(sum)));
+    qunsetenv("XDG_CACHE_HOME");
+}
+
+void tst_QQuickVideoStereo::depthOnTheGpuFromSeveralThreads()
+{
+    if (!QQuickVideoDepth::canDraw())
+        QSKIP("built without libstereo-dibr");
+    QTemporaryDir cache;
+    qputenv("XDG_CACHE_HOME", cache.path().toLocal8Bit());
+    // the frames of a video reach VideoOutput from the thread of the decoder, of the item and of the sink in turn: an OpenGL context
+    // belongs to one thread, so the drawing runs in a thread of its own (a context made current in another thread aborts)
+    const int w = 96, h = 54;
+    const QVideoFrame frame = depthFrame(Mode::DepthSideBySide, false, w, h);
+    auto o = fixedWay();
+    o.gpu = true;
+    QQuickVideoDepth::Renderer renderer;
+    QVideoFrame first;
+    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, {}, o, &first), QQuickVideoDepth::Renderer::Result::Drawn);
+    const bool onGpu = renderer.lastOnGpu();
+    for (int i = 0; i < 6; ++i) {
+        QQuickVideoDepth::Renderer::Result result = QQuickVideoDepth::Renderer::Result::Failed;
+        QVideoFrame drawn;
+        if (i % 2) {
+            result = renderer.draw(frame, Mode::DepthSideBySide, false, {}, o, &drawn);
+        } else {
+            std::thread other([&] { result = renderer.draw(frame, Mode::DepthSideBySide, false, {}, o, &drawn); });
+            other.join();
+        }
+        QCOMPARE(result, QQuickVideoDepth::Renderer::Result::Drawn);
+        QCOMPARE(renderer.lastOnGpu(), onGpu);
+        QCOMPARE(drawn.size(), first.size());
+    }
+    qunsetenv("XDG_CACHE_HOME");
+}
+
+void tst_QQuickVideoStereo::depthOnTheGpuConvertsTheColour_data()
+{
+    QTest::addColumn<int>("format");
+    QTest::addColumn<int>("space");
+    QTest::addColumn<bool>("full");
+    QTest::newRow("YUV 4:2:0, BT.601, limited") << int(QVideoFrameFormat::Format_YUV420P) << int(QVideoFrameFormat::ColorSpace_BT601) << false;
+    QTest::newRow("YUV 4:2:0, BT.709, limited") << int(QVideoFrameFormat::Format_YUV420P) << int(QVideoFrameFormat::ColorSpace_BT709) << false;
+    QTest::newRow("NV12, BT.709, limited") << int(QVideoFrameFormat::Format_NV12) << int(QVideoFrameFormat::ColorSpace_BT709) << false;
+    QTest::newRow("NV21, BT.601, full") << int(QVideoFrameFormat::Format_NV21) << int(QVideoFrameFormat::ColorSpace_BT601) << true;
+    QTest::newRow("YV12, BT.2020, limited") << int(QVideoFrameFormat::Format_YV12) << int(QVideoFrameFormat::ColorSpace_BT2020) << false;
+}
+
+void tst_QQuickVideoStereo::depthOnTheGpuConvertsTheColour()
+{
+    if (!QQuickVideoDepth::canDraw())
+        QSKIP("built without libstereo-dibr");
+    QFETCH(int, format);
+    QFETCH(int, space);
+    QFETCH(bool, full);
+    QTemporaryDir cache;
+    qputenv("XDG_CACHE_HOME", cache.path().toLocal8Bit());
+    // a picture of one colour (Y 150, U 100, V 200) and a flat depth, side by side
+    const int w = 64, h = 48, Y = 150, U = 100, V = 200;
+    QVideoFrameFormat f(QSize(2 * w, h), QVideoFrameFormat::PixelFormat(format));
+    f.setColorSpace(QVideoFrameFormat::ColorSpace(space));
+    f.setColorRange(full ? QVideoFrameFormat::ColorRange_Full : QVideoFrameFormat::ColorRange_Video);
+    f.setStereoMode(Mode::DepthSideBySide);
+    QVideoFrame frame(f);
+    QVERIFY(frame.map(QVideoFrame::WriteOnly));
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < 2 * w; ++x)
+            frame.bits(0)[y * frame.bytesPerLine(0) + x] = x < w ? Y : 128;
+    const bool semi = format == QVideoFrameFormat::Format_NV12 || format == QVideoFrameFormat::Format_NV21;
+    for (int y = 0; y < h / 2; ++y)
+        for (int x = 0; x < w; ++x) {
+            // chroma of the picture (the left half) U, V; of the depth map neutral
+            const int u = x < w / 2 ? U : 128, v = x < w / 2 ? V : 128;
+            if (semi) {
+                const bool nv21 = format == QVideoFrameFormat::Format_NV21;
+                frame.bits(1)[y * frame.bytesPerLine(1) + 2 * x] = nv21 ? v : u;
+                frame.bits(1)[y * frame.bytesPerLine(1) + 2 * x + 1] = nv21 ? u : v;
+            } else {
+                const bool yv12 = format == QVideoFrameFormat::Format_YV12;
+                frame.bits(yv12 ? 2 : 1)[y * frame.bytesPerLine(yv12 ? 2 : 1) + x] = u;
+                frame.bits(yv12 ? 1 : 2)[y * frame.bytesPerLine(yv12 ? 1 : 2) + x] = v;
+            }
+        }
+    frame.unmap();
+    QQuickVideoDepth::Renderer renderer;
+    QVideoFrame pair;
+    auto o = fixedWay();
+    o.gpu = true;
+    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, {}, o, &pair), QQuickVideoDepth::Renderer::Result::Drawn);
+    if (!renderer.lastOnGpu())
+        QSKIP("no OpenGL context in this environment");
+    // the left view is the picture as it is: its RGB, from the matrix of the colour space
+    double kr = 0.299, kb = 0.114;
+    if (space == QVideoFrameFormat::ColorSpace_BT709) {
+        kr = 0.2126;
+        kb = 0.0722;
+    } else if (space == QVideoFrameFormat::ColorSpace_BT2020) {
+        kr = 0.2627;
+        kb = 0.0593;
+    }
+    const double yy = full ? Y / 255.0 : (Y - 16) / 219.0;
+    const double cb = full ? (U - 128) / 255.0 : (U - 128) / 224.0, cr = full ? (V - 128) / 255.0 : (V - 128) / 224.0;
+    const double r = yy + 2 * (1 - kr) * cr, b = yy + 2 * (1 - kb) * cb, g = (yy - kr * r - kb * b) / (1 - kr - kb);
+    QVERIFY(pair.map(QVideoFrame::ReadOnly));
+    const uchar *px = pair.bits(0) + (h / 2) * pair.bytesPerLine(0) + 4 * (w / 4);
+    auto clamped = [](double v) { return int(std::lround(std::clamp(v, 0.0, 1.0) * 255)); };
+    QVERIFY2(std::abs(px[0] - clamped(r)) <= 2 && std::abs(px[1] - clamped(g)) <= 2 && std::abs(px[2] - clamped(b)) <= 2 && px[3] == 255,
+             qPrintable(u"RGBA %1 %2 %3 %4, expected %5 %6 %7"_s.arg(px[0]).arg(px[1]).arg(px[2]).arg(px[3]).arg(clamped(r)).arg(clamped(g)).arg(clamped(b))));
+    pair.unmap();
+    qunsetenv("XDG_CACHE_HOME");
 }
 
 void tst_QQuickVideoStereo::depthInVideoOutput()
@@ -750,7 +1045,7 @@ void tst_QQuickVideoStereo::depthRotatedFormats()
     const QSize shown = degrees % 180 ? QSize(h, w) : QSize(w, h);
     QQuickVideoDepth::Renderer renderer;
     QVideoFrame pair;
-    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, {}, {}, &pair),
+    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, {}, fixedWay(), &pair),
              QQuickVideoDepth::Renderer::Result::Drawn);
     QCOMPARE(pair.size(), QSize(2 * shown.width(), shown.height()));
     QCOMPARE(int(pair.pixelFormat()), pixelFormat);
@@ -801,7 +1096,7 @@ void tst_QQuickVideoStereo::depthRotated()
 
     QQuickVideoDepth::Renderer renderer;
     QVideoFrame pair;
-    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, {}, {}, &pair),
+    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, {}, fixedWay(), &pair),
              QQuickVideoDepth::Renderer::Result::Drawn);
     QCOMPARE(pair.size(), QSize(2 * shown.width(), shown.height()));
     QCOMPARE(pair.rotation(), QtVideo::Rotation::None);
