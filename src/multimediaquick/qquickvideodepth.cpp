@@ -1612,13 +1612,20 @@ private:
 class DrawnViewsBuffer final : public QHwVideoBuffer
 {
 public:
-    DrawnViewsBuffer(std::shared_ptr<GpuDrawer> drawer, const GpuDrawer::Views &views, const QVideoFrameFormat &format,
+    // The frame does not keep the drawer alive: the drawer (its context, its QRhi and the decoder's converters made on it) goes with the
+    // Renderer, before the decoder's own state that the converters use goes (a CUDA converter pushes the decoder's CUDA context when it is
+    // let go). A frame that outlives it has no texture to give and nothing to read back.
+    DrawnViewsBuffer(const std::shared_ptr<GpuDrawer> &drawer, const GpuDrawer::Views &views, const QVideoFrameFormat &format,
                      std::shared_ptr<std::atomic<int>> readBacks)
-        : QHwVideoBuffer(QVideoFrame::RhiTextureHandle), m_drawer(std::move(drawer)), m_views(views), m_format(format),
+        : QHwVideoBuffer(QVideoFrame::RhiTextureHandle), m_drawer(drawer), m_views(views), m_format(format),
           m_readBacks(std::move(readBacks))
     {
     }
-    ~DrawnViewsBuffer() override { m_drawer->recycle(m_views); }
+    ~DrawnViewsBuffer() override
+    {
+        if (const auto drawer = m_drawer.lock())
+            drawer->recycle(m_views);
+    }
 
     MapData map(QVideoFrame::MapMode mode) override
     {
@@ -1635,7 +1642,8 @@ public:
                 dst[i] = reinterpret_cast<uchar *>(m_bytes[i].data());
                 m_stride[i] = stride[i];
             }
-            if (!m_drawer->readBack(m_views, dst, stride))
+            const auto drawer = m_drawer.lock();
+            if (!drawer || !drawer->readBack(m_views, dst, stride))
                 return {};
             ++*m_readBacks;
             m_mapped = true;
@@ -1653,13 +1661,14 @@ public:
     QVideoFrameFormat format() const override { return m_format; }
     quint64 textureHandle(QRhi &rhi, int plane) override
     {
-        if (plane < 0 || plane >= m_views.nplanes || m_views.generation != m_drawer->generation() || !m_drawer->takenBy(rhi))
+        const auto drawer = m_drawer.lock();
+        if (!drawer || plane < 0 || plane >= m_views.nplanes || m_views.generation != drawer->generation() || !drawer->takenBy(rhi))
             return 0;
         return m_views.plane[plane].id;
     }
 
 private:
-    std::shared_ptr<GpuDrawer> m_drawer;
+    std::weak_ptr<GpuDrawer> m_drawer;
     GpuDrawer::Views m_views;
     QVideoFrameFormat m_format;
     std::shared_ptr<std::atomic<int>> m_readBacks;
@@ -1680,7 +1689,7 @@ struct Renderer::Private
     std::vector<float> table, layerTable;
     std::vector<uint16_t> lut;
 #ifdef QT_MM_DEPTH_GPU
-    // shared with the frames of textures handed to the sink: the context lives as long as one of them
+    // owned here; the frames of textures handed to the sink look at it without keeping it alive
     std::shared_ptr<GpuDrawer> gpuOwner = std::make_shared<GpuDrawer>();
     GpuDrawer &gpu = *gpuOwner;
 #endif

@@ -104,6 +104,7 @@ private slots:
     void depthViewsReachTheSinkAsTextures();
     void depthTextureFramesConvertLikeTheCopies_data();
     void depthTextureFramesConvertLikeTheCopies();
+    void depthTextureFrameOutlivesTheRenderer();
     void depthRotated_data();
     void depthRotated();
     void depthRotatedFormats_data();
@@ -1269,6 +1270,40 @@ void tst_QQuickVideoStereo::depthImportsHardwareFrames()
 // equivalents of the codes: fewer than one pixel in 500 off by more than 2, a mean under 0.25
 // A DMA-BUF another GPU accepts and reads as zeros (the first import on the A10, before the filters were set): luma and chroma all zero is
 // no picture, so the frames are copied from then on and the reason is said; a frame with a picture is imported (the control, above)
+// The drawer (its context, its QRhi and the converters of the decoder made on it) goes with the Renderer, before the decoder's own state: a
+// converter that is let go later pushes a CUDA context that is gone (a crash at the end of the first NVDEC run that handed textures to the sink).
+// A frame of textures that outlives the Renderer has nothing to give and nothing to read back, and is let go without harm.
+void tst_QQuickVideoStereo::depthTextureFrameOutlivesTheRenderer()
+{
+    if (!QQuickVideoDepth::canDraw())
+        QSKIP("built without libstereo-dibr");
+    if (qgetenv("QSG_RHI_BACKEND") != "opengl")
+        QSKIP("QSG_RHI_BACKEND=opengl is not set: the sink must draw with OpenGL");
+    QTemporaryDir cache;
+    qputenv("XDG_CACHE_HOME", cache.path().toLocal8Bit());
+    QQuickWindow window;
+    window.resize(64, 64);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QRhi *rhi = nullptr;
+    QTRY_VERIFY((rhi = QQuickWindowPrivate::get(&window)->rhi) != nullptr);
+    const QVideoFrame frame = depthFrame(Mode::DepthSideBySide, false, 128, 64);
+    QVideoFrame drawn;
+    {
+        QQuickVideoDepth::Renderer renderer;
+        renderer.setSinkRhi(rhi);
+        QQuickVideoDepth::Options o = fixedWay();
+        o.gpu = true;
+        for (int i = 0; i < 3; ++i)
+            QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, {}, o, &drawn), QQuickVideoDepth::Renderer::Result::Drawn);
+        QCOMPARE(renderer.lastViewsRoute(), QQuickVideoDepth::Renderer::ViewsRoute::Texture);
+        QVERIFY(drawn.isValid());
+    }
+    // the Renderer is gone: the frame cannot be read back, and is let go without a crash
+    QVERIFY(!drawn.map(QVideoFrame::ReadOnly));
+    drawn = {};
+}
+
 void tst_QQuickVideoStereo::depthRefusesEmptyImportedPlanes()
 {
     if (!QQuickVideoDepth::canDraw())
