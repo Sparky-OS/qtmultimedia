@@ -676,7 +676,7 @@ QVideoFrame preTurnedDepthFrame(const QVideoFrame &source, int w, int h, int deg
 namespace {
 
 // A picture and its depth map side by side, from two gray images, in a pixel format with chroma
-// subsampling (YUV 4:2:0) or interleaved samples (BGRA, the depth in green)
+// subsampling (YUV 4:2:0) or interleaved samples (RGBA, the depth in green)
 QVideoFrame grayDepthFrame(const QImage &picture, const QImage &depth, QVideoFrameFormat::PixelFormat pixelFormat)
 {
     const int w = picture.width(), h = picture.height();
@@ -689,7 +689,7 @@ QVideoFrame grayDepthFrame(const QImage &picture, const QImage &depth, QVideoFra
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < 2 * w; ++x) {
             const uchar v = x < w ? picture.constScanLine(y)[x] : depth.constScanLine(y)[x - w];
-            if (pixelFormat == QVideoFrameFormat::Format_BGRA8888) {
+            if (pixelFormat == QVideoFrameFormat::Format_RGBA8888) {
                 uchar *px = frame.bits(0) + y * frame.bytesPerLine(0) + 4 * x;
                 px[0] = px[1] = px[2] = v;
                 px[3] = 255;
@@ -712,7 +712,7 @@ QImage componentOf(const QVideoFrame &frame, QRect region, int component)
     QImage image(region.size(), QImage::Format_Grayscale8);
     if (!f.map(QVideoFrame::ReadOnly))
         return {};
-    const bool bgra = f.pixelFormat() == QVideoFrameFormat::Format_BGRA8888;
+    const bool bgra = f.pixelFormat() == QVideoFrameFormat::Format_RGBA8888;
     for (int y = 0; y < region.height(); ++y)
         for (int x = 0; x < region.width(); ++x)
             image.scanLine(y)[x] = bgra ? f.bits(0)[(region.y() + y) * f.bytesPerLine(0) + 4 * (region.x() + x) + component]
@@ -730,13 +730,10 @@ void tst_QQuickVideoStereo::depthRotatedFormats_data()
     QTest::newRow("YUV 4:2:0, 90") << int(QVideoFrameFormat::Format_YUV420P) << 90;
     QTest::newRow("YUV 4:2:0, 270") << int(QVideoFrameFormat::Format_YUV420P) << 270;
     QTest::newRow("YUV 4:2:0, 180") << int(QVideoFrameFormat::Format_YUV420P) << 180;
-    QTest::newRow("BGRA, 90") << int(QVideoFrameFormat::Format_BGRA8888) << 90;
-    QTest::newRow("BGRA, 180") << int(QVideoFrameFormat::Format_BGRA8888) << 180;
 }
 
 // The formats whose samples are subsampled or interleaved are turned plane by plane: the drawn frame
-// keeps the pixel format and the picture is the turned one (the parallax is checked for the planar
-// format, whose luma the block matching reads)
+// keeps the pixel format, the picture is the turned one and the box is at its parallax
 void tst_QQuickVideoStereo::depthRotatedFormats()
 {
     if (!QQuickVideoDepth::canDraw())
@@ -758,9 +755,20 @@ void tst_QQuickVideoStereo::depthRotatedFormats()
     QCOMPARE(pair.size(), QSize(2 * shown.width(), shown.height()));
     QCOMPARE(int(pair.pixelFormat()), pixelFormat);
     QCOMPARE(componentOf(pair, QRect(QPoint(0, 0), shown), 1), turned(picture, degrees, false));
+    const QPoint box = turnedPoint(QPoint(w * 3 / 8, h / 2), QSize(w, h), degrees, false);
+    const int expected = qRound(expectedParallax({}, 160, shown.width()));
     if (pixelFormat == QVideoFrameFormat::Format_YUV420P) {
-        const QPoint box = turnedPoint(QPoint(w * 3 / 8, h / 2), QSize(w, h), degrees, false);
-        QCOMPARE(shiftAt(pair, box.y(), box.x(), 12), qRound(expectedParallax({}, 160, shown.width())));
+        QCOMPARE(shiftAt(pair, box.y(), box.x(), 12), expected);
+    } else {
+        // interleaved samples: the box moved by its parallax, sample for sample, in the green channel
+        const QImage left = componentOf(pair, QRect(QPoint(0, 0), shown), 1);
+        const QImage right = componentOf(pair, QRect(QPoint(shown.width(), 0), shown), 1);
+        int matching = 0;
+        for (int dy = -4; dy <= 4; ++dy)
+            for (int dx = -4; dx <= 4; ++dx)
+                matching += left.constScanLine(box.y() + dy)[box.x() + dx]
+                        == right.constScanLine(box.y() + dy)[box.x() + dx + expected];
+        QCOMPARE(matching, 81);
     }
 }
 
