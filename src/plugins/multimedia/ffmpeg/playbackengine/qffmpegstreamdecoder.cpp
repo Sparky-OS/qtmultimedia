@@ -4,6 +4,9 @@
 #include "playbackengine/qffmpegstreamdecoder_p.h"
 #include "playbackengine/qffmpegmediadataholder_p.h"
 #include <qloggingcategory.h>
+extern "C" {
+#include <libavutil/stereo3d.h>
+}
 
 QT_BEGIN_NAMESPACE
 
@@ -26,6 +29,7 @@ StreamDecoder::StreamDecoder(const PlaybackEngineObjectID &id, const CodecContex
 StreamDecoder::~StreamDecoder()
 {
     avcodec_flush_buffers(m_codecContext.context());
+    stereo_av_pair_reset(m_codecContext.stereoPair());
 }
 
 void StreamDecoder::seek(quint64 sessionID, TrackPosition pos, const LoopOffset &offset)
@@ -33,6 +37,7 @@ void StreamDecoder::seek(quint64 sessionID, TrackPosition pos, const LoopOffset 
     updateSession(sessionID, [this, pos, offset]() {
         m_sessionCtx = { offset.loopStartTimeUs.asDuration() + pos };
         avcodec_flush_buffers(m_codecContext.context());
+        stereo_av_pair_reset(m_codecContext.stereoPair());
     });
 }
 
@@ -73,6 +78,7 @@ void StreamDecoder::doNextStep()
                                   << packet.loopOffset().loopIndex;
 
         avcodec_flush_buffers(m_codecContext.context());
+        stereo_av_pair_reset(m_codecContext.stereoPair());
         m_sessionCtx.offset = packet.loopOffset();
     }
 
@@ -169,6 +175,8 @@ void StreamDecoder::receiveAVFrames(bool flushPacket)
         const auto receiveFrameResult = avcodec_receive_frame(m_codecContext.context(), avFrame.get());
 
         if (receiveFrameResult == AVERROR_EOF || receiveFrameResult == AVERROR(EAGAIN)) {
+            if (receiveFrameResult == AVERROR_EOF)
+                stereo_av_pair_reset(m_codecContext.stereoPair());
             if (flushPacket && receiveFrameResult == AVERROR(EAGAIN)) {
             // The documentation says that in the EAGAIN state output is not available. The new
             // input must be sent. It does not say that this state can also be returned for
@@ -191,11 +199,26 @@ void StreamDecoder::receiveAVFrames(bool flushPacket)
         }
 
 
+        bool multiview = false;
+        if (m_trackType == QPlatformMediaPlayer::VideoStream) {
+            int paired = stereo_av_pair_frame(m_codecContext.stereoPair(), m_codecContext.context(), avFrame.get(), 1);
+            if (paired == 0)
+                continue;
+            if (paired < 0) {
+                emit error(QMediaPlayer::FormatError, err2str(paired));
+                break;
+            }
+            multiview = paired == 2;
+        }
+
         // Avoid starvation on FFmpeg decoders with fixed size frame pool
         if (m_trackType == QPlatformMediaPlayer::VideoStream)
             avFrame = copyFromHwPool(std::move(avFrame));
 
-        onFrameFound({ m_sessionCtx.offset, std::move(avFrame), m_codecContext, id() });
+        Frame frame{ m_sessionCtx.offset, std::move(avFrame), m_codecContext, id() };
+        if (multiview)
+            frame.setMultiview(stereo_av_pair_base_eye(m_codecContext.stereoPair()) == AV_STEREO3D_VIEW_RIGHT);
+        onFrameFound(frame);
     }
 }
 

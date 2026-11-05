@@ -80,6 +80,11 @@ VideoRenderer::RenderingResult VideoRenderer::renderInternal(Frame frame)
         m_stereoMode = stereo->mode;
         m_stereoFlags = stereo->flags;
     }
+    if (frame.multiview()) {
+        m_stereoFlags |= QVideoFrameFormat::StereoFlag::Multiview;
+        if (frame.baseViewRight())
+            m_stereoFlags |= QVideoFrameFormat::StereoFlag::BaseViewRight;
+    }
     format.setStereoMode(m_stereoMode);
     format.setStereoFlags(m_stereoFlags);
     format.setStereoView(stereo ? stereo->view : QVideoFrameFormat::StereoView::Packed);

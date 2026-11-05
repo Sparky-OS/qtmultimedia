@@ -1166,7 +1166,11 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
         displaySize = frameSize;
         packing.mode = format.stereoMode();
         packing.rightEyeFirst = format.stereoFlags().testFlag(QVideoFrameFormat::StereoFlag::RightEyeFirst);
-        if (st.input != StereoAutomatic) {
+        const bool multiview = format.stereoFlags().testFlag(QVideoFrameFormat::StereoFlag::Multiview);
+        const bool baseOnly = multiview && (st.input == StereoNone || st.view == StereoFlat);
+        if (multiview)
+            packing.size = Size::Full;
+        if (st.input != StereoAutomatic && !baseOnly) {
             packingFromInput(st.input, &packing);
         }
 #ifdef QT_MM_STEREO_POLICY
@@ -1178,7 +1182,7 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
         if (storedSize != frameSize)
             packing.displaySize = frameSize;
         twoViews = hasTwoViews(packing.mode) && !frameSize.isEmpty();
-        result.video = twoViews;
+        result.video = twoViews && !baseOnly;
         result.packing = packing.mode == StereoMode::None ? StereoNone
                                                           : inputFromPacking(packing, frameSize);
         if (!twoViews)
@@ -1188,7 +1192,7 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
         // a surface of its own is a rectangle of the window: it cannot be cropped by the item, rotated or mirrored
         const bool plain = transformation.rotation == QtVideo::Rotation::None
                 && !transformation.mirroredHorizontallyAfterRotation && !mirrored && !cropped;
-        const bool rightFirst = packing.rightEyeFirst != st.swapEyes;
+        const bool rightFirst = packing.rightEyeFirst != (baseOnly ? false : st.swapEyes);
         if (twoViews && packing.mode == StereoMode::FrameSequence) {
             // The eye this frame is for. Frames that say it, and say it differently from one
             // frame to the next, are trusted; a stream that says one view for all of them (the stream's
@@ -1216,7 +1220,7 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
 #ifdef QT_MM_STEREO_LAYER
         // a video whose colours the compositor cannot be told (HLG without HLG, say) is better
         // shown by the scene graph, which maps them to what the window shows
-        result.layerWanted = twoViews && st.view == StereoBothEyes && plain && stereoLayerSupported()
+        result.layerWanted = twoViews && !baseOnly && st.view == StereoBothEyes && plain && stereoLayerSupported()
                 && QQuickVideoStereoLayer::canDescribe({ format.colorSpace(), format.colorTransfer(),
                                                          format.colorRange(), format.maxLuminance() });
         result.layerActive = result.layerWanted && presenterReady;
@@ -1271,10 +1275,20 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
 #else
         Q_UNUSED(plain);
 #endif
-        if (!shownInLayer && twoViews && st.view != StereoFlat) {
+        if (!shownInLayer && twoViews && (baseOnly || st.view != StereoFlat)) {
             // one view, in the scene graph: the left, if both are wanted and cannot be shown
-            const int wanted = st.view == StereoRightEye ? 1 : 0;
-            if (packing.mode == StereoMode::FrameSequence) {
+            const bool fallback = multiview && st.view == StereoBothEyes;
+            const int wanted = (baseOnly || fallback)
+                    ? int(format.stereoFlags().testFlag(QVideoFrameFormat::StereoFlag::BaseViewRight))
+                    : st.view == StereoRightEye ? 1 : 0;
+            if (multiview) {
+                // The ordinary fallback is the physical codec base view even
+                // when the user corrects the order of the stereo presentation.
+                const int index = (baseOnly || fallback) ? wanted : (rightFirst ? 1 - wanted : wanted);
+                shown = qVideoFrameView(frame, index);
+                displaySize = shown.size();
+                result.eyeRect = QRectF(0, 0, 1, 1);
+            } else if (packing.mode == StereoMode::FrameSequence) {
                 skip = !repeated && eye != wanted;
                 displaySize = frameSize;
             } else {

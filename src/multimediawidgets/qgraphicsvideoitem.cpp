@@ -1,9 +1,11 @@
 // Copyright (C) 2016 The Qt Company Ltd.
 // SPDX-License-Identifier: LicenseRef-Qt-Commercial OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
+#include <QtGui/qpainter.h>
 #include "qgraphicsvideoitem.h"
 
 #include <QtMultimedia/qvideosink.h>
+#include <QtMultimedia/private/qvideoframeconverter_p.h>
 #include <QtMultimedia/qvideoframe.h>
 #include <QtMultimedia/qvideoframeformat.h>
 
@@ -57,7 +59,11 @@ void QGraphicsVideoItemPrivate::_q_present(const QVideoFrame &frame)
     q_ptr->update(boundingRect);
 
     if (frame.isValid()) {
-        const QSize &size = frame.surfaceFormat().viewport().size();
+        QSize size = frame.surfaceFormat().viewport().size();
+        if (frame.surfaceFormat().stereoFlags().testFlag(QVideoFrameFormat::StereoFlag::Multiview)) {
+            size.setWidth(size.width() / 2);
+            size = qRotatedFrameSize(size, qNormalizedFrameTransformation(frame).rotation);
+        }
         if (nativeSize != size) {
             nativeSize = size;
 
@@ -216,7 +222,12 @@ void QGraphicsVideoItem::paint(QPainter *painter, const QStyleOptionGraphicsItem
     Q_UNUSED(option);
     Q_UNUSED(widget);
 
-    d->m_frame.paint(painter, d->rect, { Qt::transparent, d->m_aspectRatioMode });
+    if (d->m_frame.surfaceFormat().stereoFlags().testFlag(QVideoFrameFormat::StereoFlag::Multiview)) {
+        const int eye = d->m_frame.surfaceFormat().stereoFlags().testFlag(QVideoFrameFormat::StereoFlag::BaseViewRight) ? 1 : 0;
+        painter->drawImage(d->boundingRect, qImageFromVideoFrameView(d->m_frame, eye, QVideoFrameImageDepth::Float32));
+    } else {
+        d->m_frame.paint(painter, d->rect, { Qt::transparent, d->m_aspectRatioMode });
+    }
 }
 
 /*!

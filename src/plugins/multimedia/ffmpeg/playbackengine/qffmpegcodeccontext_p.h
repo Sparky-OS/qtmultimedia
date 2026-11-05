@@ -22,6 +22,8 @@
 #include <QtCore/qshareddata.h>
 #include <QtCore/private/qexpected_p.h>
 
+#include <stereo-av.h>
+
 QT_BEGIN_NAMESPACE
 
 class QPlaybackOptions;
@@ -33,7 +35,8 @@ class CodecContext
     struct Data : QSharedData
     {
         Data(AVCodecContextUPtr context, AVStream *avStream, AVFormatContext *formatContext,
-             std::unique_ptr<QFFmpeg::HWAccel> hwAccel);
+             std::unique_ptr<QFFmpeg::HWAccel> hwAccel, std::shared_ptr<StereoAVPair> stereoPair);
+        std::shared_ptr<StereoAVPair> stereoPair;
         AVCodecContextUPtr context;
         AVStream *stream = nullptr;
         AVFormatContext *formatContext = nullptr;
@@ -47,6 +50,7 @@ public:
 
     AVRational pixelAspectRatio(AVFrame *frame) const;
 
+    StereoAVPair *stereoPair() const { return d->stereoPair.get(); }
     AVCodecContext *context() const { return d->context.get(); }
     AVStream *stream() const { return d->stream; }
     uint streamIndex() const { return d->stream->index; }

@@ -717,6 +717,8 @@ void QVideoFrameFormat::setColorRange(ColorRange range)
 /*!
     \enum QVideoFrameFormat::StereoFlag
 
+    \value Multiview The frame contains two decoded multiview images at their native dimensions.
+    \value BaseViewRight The multiview base image is the right view, used for ordinary 2D fallback.
     \value RightEyeFirst
     The first view of the packing is the right eye's (content_interpretation_type 2 of the frame
     packing arrangement SEI, the "right eye first" StereoMode values, AV_STEREO3D_FLAG_INVERT).

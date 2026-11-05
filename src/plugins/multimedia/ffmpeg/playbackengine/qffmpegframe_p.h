@@ -33,6 +33,8 @@ struct Frame
 {
     struct Data
     {
+        bool multiview = false;
+        bool baseViewRight = false;
         Data(const LoopOffset &offset, AVFrameUPtr f, const CodecContext &codecContext,
              const PlaybackEngineObjectID &sourceID)
             : loopOffset(offset),
@@ -93,6 +95,9 @@ struct Frame
         : d(new Data(offset, text, pts, duration, sourceId))
     {
     }
+    void setMultiview(bool baseRight) { data().multiview = true; data().baseViewRight = baseRight; }
+    bool multiview() const { return data().multiview; }
+    bool baseViewRight() const { return data().baseViewRight; }
     bool isValid() const { return !!d; }
 
     AVFrame *avFrame() const { return data().frame.get(); }

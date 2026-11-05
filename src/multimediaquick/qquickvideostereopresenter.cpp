@@ -86,30 +86,30 @@ void QQuickVideoStereoPresenter::run()
 void QQuickVideoStereoPresenter::process(Job &job)
 {
     const QVideoFrameFormat format = job.frame.surfaceFormat();
-    const QImage image = qImageFromVideoFrame(
-            job.frame, job.wide ? QVideoFrameImageDepth::Float32 : QVideoFrameImageDepth::Float16);
-    if (image.isNull())
-        return;
-    job.frame = {};
-
-    // which of the packing's views is for the left eye
     const bool rightFirst = job.packing.rightEyeFirst != job.swapEyes;
+    const auto depth = job.wide ? QVideoFrameImageDepth::Float32 : QVideoFrameImageDepth::Float16;
     QImage left, right;
-    if (job.packing.mode == Mode::FrameSequence) {
-        // each frame is one view (frameView is the eye of the first), the other frame is the other eye's
-        const QImage other = qImageFromVideoFrame(
-                job.otherFrame, job.wide ? QVideoFrameImageDepth::Float32 : QVideoFrameImageDepth::Float16);
-        QImage mine = storedView(image, job.packing, 0);
-        QImage theirs = storedView(other, job.packing, 0);
-        if (mine.isNull() || theirs.isNull() || mine.size() != theirs.size())
-            return;
-        left = job.frameView == 0 ? mine : theirs;
-        right = job.frameView == 0 ? theirs : mine;
+    if (format.stereoFlags().testFlag(QVideoFrameFormat::StereoFlag::Multiview)) {
+        left = qImageFromVideoFrameView(job.frame, rightFirst ? 1 : 0, depth);
+        right = qImageFromVideoFrameView(job.frame, rightFirst ? 0 : 1, depth);
     } else {
-        // each view at the resolution the frame carries it: the compositor resizes it once
-        left = storedView(image, job.packing, rightFirst ? 1 : 0);
-        right = storedView(image, job.packing, rightFirst ? 0 : 1);
+        const QImage image = qImageFromVideoFrame(job.frame, depth);
+        if (image.isNull())
+            return;
+        if (job.packing.mode == Mode::FrameSequence) {
+            const QImage other = qImageFromVideoFrame(job.otherFrame, depth);
+            QImage mine = storedView(image, job.packing, 0);
+            QImage theirs = storedView(other, job.packing, 0);
+            if (mine.isNull() || theirs.isNull() || mine.size() != theirs.size())
+                return;
+            left = job.frameView == 0 ? mine : theirs;
+            right = job.frameView == 0 ? theirs : mine;
+        } else {
+            left = storedView(image, job.packing, rightFirst ? 1 : 0);
+            right = storedView(image, job.packing, rightFirst ? 0 : 1);
+        }
     }
+    job.frame = {};
     if (left.isNull() || right.isNull())
         return;
 
@@ -140,7 +140,7 @@ void QQuickVideoStereoPresenter::process(Job &job)
             }
             return std::count(seen.begin(), seen.end(), true);
         };
-        qCDebug(qLcStereoPresenter) << "frame" << format.frameSize() << "image" << image.size() << "packing"
+        qCDebug(qLcStereoPresenter) << "frame" << format.frameSize() << "packing"
                                     << int(job.packing.mode) << int(job.packing.size) << "right first" << job.packing.rightEyeFirst << "swap" << job.swapEyes << "frame eye" << job.frameView << "stereo view" << int(format.stereoView()) << "view" << left.size() << "format"
                                     << (bufferFormat == BufferFormat::Xrgb8888 ? "XRGB8888"
                                         : bufferFormat == BufferFormat::Xrgb2101010 ? "XRGB2101010"

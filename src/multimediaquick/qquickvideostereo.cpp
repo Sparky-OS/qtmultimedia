@@ -405,12 +405,22 @@ int bytesPerPixel(BufferFormat format)
 
 void writePair(const QImage &left, const QImage &right, BufferFormat format, uchar *dst, int stride)
 {
-    const int w = left.width();
-    const int h = left.height();
+    // Native view extraction may return half-float images. Normalize the
+    // representation before reading float components for any output format.
+    const QImage views[] = {
+        left.format() == QImage::Format_RGBA32FPx4_Premultiplied ? left
+            : left.convertToFormat(QImage::Format_RGBA32FPx4_Premultiplied),
+        right.format() == QImage::Format_RGBA32FPx4_Premultiplied ? right
+            : right.convertToFormat(QImage::Format_RGBA32FPx4_Premultiplied)
+    };
+    if (views[0].isNull() || views[1].isNull() || views[0].size() != views[1].size())
+        return;
+    const int w = views[0].width();
+    const int h = views[0].height();
     for (int y = 0; y < h; ++y) {
         uchar *line = dst + qsizetype(y) * stride;
         for (int e = 0; e < 2; ++e) {
-            const float *in = reinterpret_cast<const float *>((e ? right : left).constScanLine(y));
+            const float *in = reinterpret_cast<const float *>(views[e].constScanLine(y));
             switch (format) {
             case BufferFormat::Xrgb8888: {
                 quint32 *out = reinterpret_cast<quint32 *>(line) + e * w;

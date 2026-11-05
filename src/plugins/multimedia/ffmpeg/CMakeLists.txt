@@ -4,6 +4,9 @@
 qt_find_package(EGL)
 qt_find_package(VAAPI COMPONENTS VA DRM PROVIDED_TARGETS VAAPI::VAAPI MODULE_NAME multimedia QMAKE_LIB vaapi)
 
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(STEREO_AV REQUIRED IMPORTED_TARGET GLOBAL stereo-av>=1.12.0)
+
 qt_internal_add_module(FFmpegMediaPluginImplPrivate
     STATIC
     INTERNAL_MODULE
@@ -351,3 +354,5 @@ if(PkgConfig_FOUND)
         )
     endif()
 endif()
+
+target_link_libraries(FFmpegMediaPluginImplPrivate PRIVATE PkgConfig::STEREO_AV)

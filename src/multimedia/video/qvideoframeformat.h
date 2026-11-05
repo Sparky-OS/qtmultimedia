@@ -146,7 +146,9 @@ public:
 
     enum class StereoFlag
     {
-        RightEyeFirst = 0x1
+        RightEyeFirst = 0x1,
+        Multiview = 0x2,
+        BaseViewRight = 0x4
     };
     Q_DECLARE_FLAGS(StereoFlags, StereoFlag)
     Q_FLAG(StereoFlags)

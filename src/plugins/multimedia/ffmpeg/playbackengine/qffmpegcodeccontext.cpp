@@ -5,6 +5,9 @@
 #include "qffmpegcodecstorage_p.h"
 
 #include <QtMultimedia/qplaybackoptions.h>
+extern "C" {
+#include <libavutil/pixdesc.h>
+}
 #include <QtCore/qloggingcategory.h>
 
 QT_BEGIN_NAMESPACE
@@ -17,8 +20,10 @@ namespace QFFmpeg {
 
 CodecContext::Data::Data(AVCodecContextUPtr context, AVStream *avStream,
                          AVFormatContext *avFormatContext,
-                         std::unique_ptr<QFFmpeg::HWAccel> hwAccel)
-    : context(std::move(context)),
+                         std::unique_ptr<QFFmpeg::HWAccel> hwAccel,
+                         std::shared_ptr<StereoAVPair> stereoPair)
+    : stereoPair(std::move(stereoPair)),
+      context(std::move(context)),
       stream(avStream),
       formatContext(avFormatContext),
       hwAccel(std::move(hwAccel))
@@ -114,7 +119,24 @@ q23::expected<CodecContext, QString> CodecContext::create(AVStream *stream,
 
     // ### This still gives errors about wrong HW formats (as we accept all of them)
     // But it would be good to get so we can filter out pixel format we don't support natively
-    context->get_format = QFFmpeg::getFormat;
+    std::shared_ptr<StereoAVPair> stereoPair(stereo_av_pair_alloc(), [](StereoAVPair *pair) {
+        stereo_av_pair_free(&pair);
+    });
+    if (!stereoPair)
+        return q23::unexpected{ u"Failed to allocate a FFmpeg codec context"_s };
+    context->opaque = stereoPair.get();
+    context->get_format = [](AVCodecContext *ctx, const AVPixelFormat *formats) {
+        stereo_av_pair_configure(static_cast<StereoAVPair *>(ctx->opaque), ctx);
+        if (stereo_av_decoder_multiview(ctx)) {
+            for (auto fmt = formats; *fmt != AV_PIX_FMT_NONE; ++fmt) {
+                const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(*fmt);
+                if (desc && !(desc->flags & AV_PIX_FMT_FLAG_HWACCEL))
+                    return *fmt;
+            }
+            return AV_PIX_FMT_NONE;
+        }
+        return QFFmpeg::getFormat(ctx, formats);
+    };
 
     /* Init the decoder, with reference counting and threading */
     AVDictionaryHolder opts;
@@ -125,6 +147,7 @@ q23::expected<CodecContext, QString> CodecContext::create(AVStream *stream,
     av_dict_set(opts, "threads", "auto", 0);
     applyExperimentalCodecOptions(*decoder, opts);
 
+    stereo_av_decoder_views(context.get());
     ret = avcodec_open2(context.get(), decoder->get(), opts);
 
     if (ret < 0)
@@ -132,7 +155,7 @@ q23::expected<CodecContext, QString> CodecContext::create(AVStream *stream,
             QStringLiteral("Failed to open FFmpeg codec context: %1").arg(err2str(ret))
         };
 
-    return CodecContext(new Data(std::move(context), stream, formatContext, std::move(hwAccel)));
+    return CodecContext(new Data(std::move(context), stream, formatContext, std::move(hwAccel), std::move(stereoPair)));
 }
 
 QT_END_NAMESPACE

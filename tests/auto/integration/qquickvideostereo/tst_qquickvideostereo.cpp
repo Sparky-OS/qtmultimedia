@@ -57,6 +57,8 @@ private slots:
     void levels10Bit();
     void deepConversion();
     void propertiesDefault();
+    void pairImageFormats_data();
+    void pairImageFormats();
     void stereoVideoFromFrames();
 };
 
@@ -307,6 +309,64 @@ void tst_QQuickVideoStereo::stereoVideoFromFrames()
     // and the other way: nothing but the first of two views is the right eye's with swapped eyes
     output.setStereoView(QQuickVideoOutput::StereoRightEye);
     QTRY_COMPARE(output.implicitWidth(), 1920);
+}
+
+void tst_QQuickVideoStereo::pairImageFormats_data()
+{
+    QTest::addColumn<int>("imageFormat");
+    QTest::addColumn<int>("bufferFormat");
+    for (int image : { int(QImage::Format_RGBA8888_Premultiplied),
+                       int(QImage::Format_RGBA16FPx4_Premultiplied),
+                       int(QImage::Format_RGBA32FPx4_Premultiplied) }) {
+        for (int buffer = 0; buffer < 4; ++buffer)
+            QTest::newRow(qPrintable(QString::number(image) + QLatin1Char('-') + QString::number(buffer))) << image << buffer;
+    }
+}
+
+void tst_QQuickVideoStereo::pairImageFormats()
+{
+    QFETCH(int, imageFormat);
+    QFETCH(int, bufferFormat);
+    // Padding makes each row safe even for the former incorrect float32 cast.
+    QByteArray leftStorage(8 * 8 * 16, '\0'), rightStorage(8 * 8 * 16, '\0');
+    QImage left(reinterpret_cast<uchar *>(leftStorage.data()), 8, 8, 8 * 16, QImage::Format(imageFormat));
+    QImage right(reinterpret_cast<uchar *>(rightStorage.data()), 8, 8, 8 * 16, QImage::Format(imageFormat));
+    left.fill(QColor::fromRgbF(.75, .125, .25));
+    right.fill(QColor::fromRgbF(.125, .25, .75));
+    const auto format = BufferFormat(bufferFormat);
+    const int stride = 16 * bytesPerPixel(format);
+    QByteArray pixels(stride * 8, '\0');
+    writePair(left, right, format, reinterpret_cast<uchar *>(pixels.data()), stride);
+    for (int y = 0; y < 8; ++y) {
+        for (int x = 0; x < 16; ++x) {
+            const uchar *pixel = reinterpret_cast<const uchar *>(pixels.constData() + y * stride + x * bytesPerPixel(format));
+            float red, blue;
+            switch (format) {
+            case BufferFormat::Xrgb8888: {
+                const quint32 value = *reinterpret_cast<const quint32 *>(pixel);
+                red = ((value >> 16) & 255) / 255.f; blue = (value & 255) / 255.f;
+                break;
+            }
+            case BufferFormat::Xrgb2101010: {
+                const quint32 value = *reinterpret_cast<const quint32 *>(pixel);
+                red = ((value >> 20) & 1023) / 1023.f; blue = (value & 1023) / 1023.f;
+                break;
+            }
+            case BufferFormat::Xbgr16161616: {
+                const auto *value = reinterpret_cast<const quint16 *>(pixel);
+                red = value[0] / 65535.f; blue = value[2] / 65535.f;
+                break;
+            }
+            case BufferFormat::Xbgr16161616f: {
+                const auto *value = reinterpret_cast<const qfloat16 *>(pixel);
+                red = float(value[0]); blue = float(value[2]);
+                break;
+            }
+            }
+            QVERIFY2(x < 8 ? red > .7f && blue < .3f : blue > .7f && red < .3f,
+                     qPrintable(QStringLiteral("wrong eye at %1,%2: %3,%4").arg(x).arg(y).arg(red).arg(blue)));
+        }
+    }
 }
 
 QTEST_MAIN(tst_QQuickVideoStereo)
