@@ -123,7 +123,13 @@ void TextureConverter::updateBackend(AVPixelFormat fmt)
 
     applyConverterTypeByPixelFormat(m_format, m_rhi, [this](auto converterTypeIdentity) {
         using ConverterType = typename decltype(converterTypeIdentity)::type;
-        m_backend = std::make_shared<ConverterType>(&m_rhi);
+#if defined(Q_OS_LINUX) && !defined(Q_OS_ANDROID)
+        // the CUDA converter is made by its factory (it returns null when the GPU is not an NVIDIA one the frames come from)
+        if constexpr (std::is_same_v<ConverterType, CUDATextureConverterFactory>)
+            m_backend = ConverterType::create(&m_rhi);
+        else
+#endif
+            m_backend = std::make_shared<ConverterType>(&m_rhi);
     });
 }
 
