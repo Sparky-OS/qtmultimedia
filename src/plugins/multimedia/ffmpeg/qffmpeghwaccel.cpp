@@ -356,12 +356,15 @@ AVPixelFormat getFormat(AVCodecContext *codecContext, const AVPixelFormat *fmt)
         }
 
         auto format = formatAndScore.value;
+        if (!format)
+            qCWarning(qLHWAccel) << "Not decoding in hardware: none of the formats of the stream "
+                                    "is a hardware format of the device";
         // No hardware decoder outputs the depth auxiliary layer of an H.265 stream: a stream that
         // has one (the decoder says it, depth_available) is decoded in software when its depth
         // pictures are asked for (depth_output). This comes first, so that no hardware frames are
         // set up for nothing
         if (format && decoderOutputsDepthLayer(codecContext)) {
-            qCInfo(qLHWAccel) << "Not decoding in hardware: the stream has a depth layer, which "
+            qCWarning(qLHWAccel) << "Not decoding in hardware: the stream has a depth layer, which "
                                  "only software decoding outputs";
             format = std::nullopt;
         }
