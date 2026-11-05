@@ -19,6 +19,7 @@
 #include <QtCore/qrect.h>
 #include <QtCore/qpointer.h>
 #include <QtCore/qmutex.h>
+#include <QtCore/qvariant.h>
 #include <QtCore/qtimer.h>
 #include <QtQuick/qquickitem.h>
 
@@ -112,6 +113,11 @@ class Q_MULTIMEDIAQUICK_EXPORT QQuickVideoOutput : public QQuickItem
                        NOTIFY stereoDepthFarChanged)
     Q_PROPERTY(QString stereoDepthMark READ stereoDepthMark WRITE setStereoDepthMark
                        NOTIFY stereoDepthMarkChanged)
+    Q_PROPERTY(bool stereoDepthAutomatic READ stereoDepthAutomatic WRITE setStereoDepthAutomatic
+                       NOTIFY stereoDepthAutomaticChanged)
+    Q_PROPERTY(bool stereoDepthGpu READ stereoDepthGpu WRITE setStereoDepthGpu
+                       NOTIFY stereoDepthGpuChanged)
+    Q_PROPERTY(QVariantMap stereoDepthChoice READ stereoDepthChoice NOTIFY stereoDepthChoiceChanged)
     Q_MOC_INCLUDE(qvideosink.h)
     Q_MOC_INCLUDE(qvideoframe.h)
     QML_NAMED_ELEMENT(VideoOutput)
@@ -187,7 +193,8 @@ public:
         StereoDepthFillBackground,
         StereoDepthFillDepth,
         StereoDepthFillTelea,
-        StereoDepthFillNone
+        StereoDepthFillNone,
+        StereoDepthFillPyramid
     };
     Q_ENUM(StereoDepthFill)
     enum StereoDepthSmooth
@@ -308,6 +315,11 @@ public:
     qreal stereoDepthFar() const;
     void setStereoDepthFar(qreal value);
     QString stereoDepthMark() const;
+    bool stereoDepthAutomatic() const;
+    void setStereoDepthAutomatic(bool value);
+    bool stereoDepthGpu() const;
+    void setStereoDepthGpu(bool value);
+    QVariantMap stereoDepthChoice() const;
     void setStereoDepthMark(const QString &value);
 
 Q_SIGNALS:
@@ -341,6 +353,9 @@ Q_SIGNALS:
     void stereoDepthNearChanged();
     void stereoDepthFarChanged();
     void stereoDepthMarkChanged();
+    void stereoDepthAutomaticChanged();
+    void stereoDepthGpuChanged();
+    void stereoDepthChoiceChanged();
 
 protected:
     QSGNode *updatePaintNode(QSGNode *, UpdatePaintNodeData *) override;
@@ -420,6 +435,9 @@ private:
     // video and of the item in turn
     QMutex m_depthMutex;
     std::unique_ptr<QQuickVideoDepth::Renderer> m_depthRenderer;
+    // what the automatic way chose for the video that plays (guarded by m_frameMutex)
+    QVariantMap m_depthChoice;
+    void setDepthChoice(const QQuickVideoDepth::Choice &choice);
     // The layer of the views, where the platform has one (QT_MM_STEREO_LAYER): kept in the class
     // whatever the build, so that every user of this header sees the same class
     struct StereoPair;

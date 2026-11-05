@@ -31,19 +31,29 @@ QT_BEGIN_NAMESPACE
 // meaning of the samples are the depth marks (stereo-layer, docs/depth-marks.md).
 namespace QQuickVideoDepth {
 
-// Every choice of how the views are drawn, with libstereo-dibr's defaults
-struct Options
+// Every choice of how the views are drawn. The defaults are libstereo-dibr's, the one default of
+// the library (stereo_dibr_options_default()): this structure holds no copy of them.
+struct Q_MULTIMEDIAQUICK_EXPORT Options
 {
+    Options();
+
     bool enabled = true;
     int view = 0;   // 0: the picture is the left eye, 1: the middle
     int warp = 0;   // 0 forward, 1 backward, 2 layered
-    int fill = 0;   // 0 background extension, 1 depth-aided, 2 Telea, 3 none
+    int fill = 0;   // 0 background extension, 1 depth-aided, 2 Telea, 3 none, 4 pyramid
     int smooth = 0; // 0 off, 1 asymmetric Gaussian
-    double sigmaH = 10, sigmaV = 30; // the Gaussian's, pixels of a view 1920 wide
-    int radius = 5;
-    double range = 58; // the largest parallax either side of the screen, pixels of a view 1920 wide
-    double zero = 0.5; // where the screen is, from the farthest samples (0) to the nearest (1)
+    double sigmaH = 0, sigmaV = 0; // the Gaussian's, pixels of a view 1920 wide
+    int radius = 1;
+    double range = 0;  // the largest parallax either side of the screen, pixels of a view 1920 wide
+    double zero = 0;   // where the screen is, from the farthest samples (0) to the nearest (1)
     double shift = 0;  // a parallax added to all, pixels of a view 1920 wide
+    // The way (warp and fill) is not the person's: a video is drawn the best way that keeps its
+    // frame rate on the GPU (or the processor) that draws it, measured once for each GPU and size
+    // (stereo_dibr_choose_from_times()). false: warp and fill are the person's, for everything.
+    bool automatic = true;
+    // Draw on the GPU when it can (OpenGL, libstereo-dibr's passes); false draws with the C code
+    // on the processor
+    bool gpu = true;
     // -1: what the video says; else a kind of libstereo-dibr (0 nearness .. 9 metric)
     int meaning = -1;
     double zNear = 0, zFar = 0; // the near and far distances, when both are set
@@ -59,6 +69,23 @@ Q_MULTIMEDIAQUICK_EXPORT QRect pictureRect(QVideoFrameFormat::StereoMode mode, b
 
 // Whether libstereo-dibr is there to draw the views
 Q_MULTIMEDIAQUICK_EXPORT bool canDraw();
+
+// What the automatic way chose for the video that plays, and why: the way, whether it keeps the frame
+// rate, the best way it gave up and where it draws
+struct Q_MULTIMEDIAQUICK_EXPORT Choice
+{
+    bool valid = false;
+    int warp = 0, fill = 0;
+    bool keepsUp = true;
+    double fps = 0;
+    double ms = 0, budgetMs = 0;
+    int skippedWarp = -1, skippedFill = -1;
+    double skippedMs = 0;
+    bool onGpu = false;
+    QString gpu; // the GPU's name, or the processor's
+
+    bool operator==(const Choice &o) const;
+};
 
 class Q_MULTIMEDIAQUICK_EXPORT Renderer
 {
@@ -80,6 +107,11 @@ public:
     // StereoMode::SideBySide. fileMark is what the stream says a sample means.
     Result draw(const QVideoFrame &frame, QVideoFrameFormat::StereoMode mode, bool depthFirst,
                 const QString &fileMark, const Options &options, QVideoFrame *out);
+
+    // What the last draw() chose (valid only for the automatic way) and where it drew
+    Choice choice() const;
+    // Whether the last draw() was on the GPU
+    bool lastOnGpu() const;
 
 private:
     struct Private;

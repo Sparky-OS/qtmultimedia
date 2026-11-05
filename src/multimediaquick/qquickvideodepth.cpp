@@ -8,15 +8,31 @@
 #include <QtMultimedia/private/qvideotransformation_p.h>
 #include <QtGui/qimage.h>
 
+#include <QtCore/qloggingcategory.h>
+#include <QtCore/qthread.h>
+#include <QtGui/qtguiglobal.h>
+
 #ifdef QT_MM_STEREO_DIBR
 #  include <stereo-dibr.h>
+#  include <stereo-dibr-gl.h>
+#  if QT_CONFIG(opengl)
+#    include <QtGui/qopenglcontext.h>
+#    include <QtGui/qopenglextrafunctions.h>
+#    include <QtGui/qoffscreensurface.h>
+#    include <QtGui/qsurfaceformat.h>
+#    define QT_MM_DEPTH_GPU
+#  endif
 #endif
 
+#include <array>
 #include <cmath>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 QT_BEGIN_NAMESPACE
+
+Q_STATIC_LOGGING_CATEGORY(qLcVideoDepth, "qt.multimedia.video.depth")
 
 namespace QQuickVideoDepth {
 
@@ -52,6 +68,33 @@ QRect pictureRect(Mode mode, bool depthFirst, QSize frameSize)
     default:
         return QRect(0, 0, w, h);
     }
+}
+
+Options::Options()
+{
+#ifdef QT_MM_STEREO_DIBR
+    // the library's one default
+    stereo_dibr_options o;
+    stereo_dibr_options_default(&o);
+    view = o.view;
+    warp = o.warp;
+    fill = o.fill;
+    smooth = o.smooth;
+    sigmaH = o.sigma_h;
+    sigmaV = o.sigma_v;
+    radius = o.radius;
+    range = o.strength;
+    zero = o.zero;
+    shift = o.shift;
+    automatic = o.automatic != 0;
+#endif
+}
+
+bool Choice::operator==(const Choice &o) const
+{
+    return valid == o.valid && warp == o.warp && fill == o.fill && keepsUp == o.keepsUp
+            && qFuzzyCompare(fps + 1, o.fps + 1) && skippedWarp == o.skippedWarp
+            && skippedFill == o.skippedFill && onGpu == o.onGpu && gpu == o.gpu;
 }
 
 bool canDraw()
@@ -322,7 +365,9 @@ TurnedPlane turnPlane(const void *src, ptrdiff_t stride, int bytes, int w, int h
     out.stride = ptrdiff_t(out.width) * bytes;
     out.data.resize(size_t(out.stride) * size_t(out.height));
     const auto *bytesIn = static_cast<const uint8_t *>(src);
-    if (bytes == 2)
+    if (bytes == 4)
+        turnSamples<uint32_t>(bytesIn, stride, w, h, rotation, t.mirroredHorizontallyAfterRotation, &out);
+    else if (bytes == 2)
         turnSamples<uint16_t>(bytesIn, stride, w, h, rotation, t.mirroredHorizontallyAfterRotation, &out);
     else
         turnSamples<uint8_t>(bytesIn, stride, w, h, rotation, t.mirroredHorizontallyAfterRotation, &out);
@@ -381,14 +426,506 @@ int packingOf(Mode mode)
     }
 }
 
+#ifdef QT_MM_DEPTH_GPU
+
+// ---- drawing on the GPU ----------------------------------------------------------------------
+// libstereo-dibr's GLSL passes (stereo-dibr-gl.h) in an OpenGL context of its own, on the GPU Qt
+// draws with (the one the platform's EGL or GLX gives this process: the Graphics page of the
+// edition chooses it for players). The frame's planes are uploaded as they are, a pass here
+// turns them into the RGBA picture the library reads, the library draws both views, and the full
+// side by side frame is read back into the frame the player shows.
+
+thread_local QOpenGLContext *g_depthContext = nullptr;
+
+stereo_dibr_gl_function resolveGl(const char *name)
+{
+    return g_depthContext ? reinterpret_cast<stereo_dibr_gl_function>(g_depthContext->getProcAddress(name))
+                          : nullptr;
+}
+
+constexpr unsigned GL_R8_ = 0x8229, GL_RG8_ = 0x822B, GL_RGBA8_ = 0x8058, GL_RED_ = 0x1903,
+                   GL_RG_ = 0x8227, GL_RGBA_ = 0x1908, GL_UNSIGNED_BYTE_ = 0x1401,
+                   GL_TEXTURE_2D_ = 0x0DE1, GL_UNPACK_ROW_LENGTH_ = 0x0CF2,
+                   GL_PACK_ROW_LENGTH_ = 0x0D02, GL_FRAMEBUFFER_ = 0x8D40,
+                   GL_COLOR_ATTACHMENT0_ = 0x8CE0, GL_FRAMEBUFFER_COMPLETE_ = 0x8CD5;
+
+const char kVertex[] = R"(
+const vec2 p[3] = vec2[3](vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+void main() { gl_Position = vec4(p[gl_VertexID], 0.0, 1.0); }
+)";
+
+// The planes of a picture into RGBA: planar (three planes), semi-planar (Y and interleaved UV) or
+// RGBA as it is stored. BT.601, BT.709 and BT.2020 matrices (Kr, Kb), limited or full range.
+const char kConvert[] = R"(
+uniform sampler2D u_y;
+uniform sampler2D u_u;
+uniform sampler2D u_v;
+uniform int u_mode;       // 0 planar, 1 semi-planar UV, 2 semi-planar VU
+uniform ivec2 u_shift;    // the chroma planes' subsampling, log2 of width and height
+uniform vec2 u_k;         // Kr, Kb
+uniform int u_full;
+out vec4 o_color;
+void main()
+{
+    ivec2 at = ivec2(gl_FragCoord.xy);
+    float y = texelFetch(u_y, at, 0).r;
+    ivec2 c = ivec2(at.x >> u_shift.x, at.y >> u_shift.y);
+    float u, v;
+    if (u_mode == 0) {
+        u = texelFetch(u_u, c, 0).r;
+        v = texelFetch(u_v, c, 0).r;
+    } else {
+        vec2 uv = texelFetch(u_u, c, 0).rg;
+        u = u_mode == 1 ? uv.r : uv.g;
+        v = u_mode == 1 ? uv.g : uv.r;
+    }
+    float yy, cb, cr;
+    if (u_full != 0) {
+        yy = y;
+        cb = (u * 255.0 - 128.0) / 255.0;
+        cr = (v * 255.0 - 128.0) / 255.0;
+    } else {
+        yy = (y * 255.0 - 16.0) / 219.0;
+        cb = (u * 255.0 - 128.0) / 224.0;
+        cr = (v * 255.0 - 128.0) / 224.0;
+    }
+    float r = yy + 2.0 * (1.0 - u_k.x) * cr;
+    float b = yy + 2.0 * (1.0 - u_k.y) * cb;
+    float g = (yy - u_k.x * r - u_k.y * b) / (1.0 - u_k.x - u_k.y);
+    o_color = vec4(clamp(vec3(r, g, b), 0.0, 1.0), 1.0);
+}
+)";
+
+// One channel of an RGBA picture as the depth map
+const char kChannel[] = R"(
+uniform sampler2D u_y;
+uniform int u_channel;
+out vec4 o_color;
+void main()
+{
+    o_color = vec4(texelFetch(u_y, ivec2(gl_FragCoord.xy), 0)[u_channel], 0.0, 0.0, 1.0);
+}
+)";
+
+class GpuDrawer
+{
+public:
+    enum class Source { Planar, SemiUV, SemiVU, Rgba };
+
+    // An OpenGL context belongs to one thread, and a video's frames come from the thread of the
+    // decoder, of the item and of the sink in turn: the context lives in a thread of its own, and
+    // everything that touches it runs there (run()), the caller waiting
+    GpuDrawer()
+    {
+        m_worker.setObjectName(QStringLiteral("QtMultimedia depth drawing"));
+        m_executor.moveToThread(&m_worker);
+        m_worker.start();
+    }
+
+    ~GpuDrawer()
+    {
+        run([this] { destroy(); });
+        m_worker.quit();
+        m_worker.wait();
+    }
+
+    template<typename F>
+    void run(F function)
+    {
+        QMetaObject::invokeMethod(&m_executor, std::move(function), Qt::BlockingQueuedConnection);
+    }
+
+    // The context and the library's passes, made on the thread that draws (a context belongs to
+    // one thread). Returns false with the reason.
+    bool ensure(QString *why)
+    {
+        if (m_gl && m_thread == QThread::currentThread())
+            return true;
+        if (m_failedThread == QThread::currentThread()) {
+            *why = m_whyNot;
+            return false;
+        }
+        destroy();
+        m_thread = QThread::currentThread();
+        auto context = std::make_unique<QOpenGLContext>();
+        QSurfaceFormat format;
+        format.setVersion(3, 3);
+        format.setProfile(QSurfaceFormat::CoreProfile);
+        context->setFormat(format);
+        if (!context->create()) {
+            // OpenGL ES 3.0, for a platform that has no desktop OpenGL
+            format = QSurfaceFormat();
+            format.setRenderableType(QSurfaceFormat::OpenGLES);
+            format.setVersion(3, 0);
+            context->setFormat(format);
+            if (!context->create())
+                return fail(QStringLiteral("no OpenGL 3.3 or OpenGL ES 3.0 context could be made"), why);
+        }
+        auto surface = std::make_unique<QOffscreenSurface>();
+        surface->setFormat(context->format());
+        surface->create();
+        if (!surface->isValid())
+            return fail(QStringLiteral("no offscreen surface could be made"), why);
+        m_context = std::move(context);
+        m_surface = std::move(surface);
+        if (!m_context->makeCurrent(m_surface.get()))
+            return fail(QStringLiteral("the OpenGL context could not be made current"), why);
+        g_depthContext = m_context.get();
+        m_f = m_context->extraFunctions();
+        m_gl = stereo_dibr_gl_create(resolveGl,
+                                     m_context->isOpenGLES() ? STEREO_DIBR_GL_ES
+                                                             : STEREO_DIBR_GL_DESKTOP);
+        if (!m_gl)
+            return fail(QStringLiteral("libstereo-dibr's passes do not build on this OpenGL"), why);
+        if (!buildPrograms())
+            return fail(QStringLiteral("the passes that read a frame's planes do not build"), why);
+        m_f->glGenVertexArrays(1, &m_vao);
+        m_f->glGenFramebuffers(1, &m_fbo);
+        m_context->doneCurrent();
+        return true;
+    }
+
+    bool makeCurrent()
+    {
+        g_depthContext = m_context.get();
+        return m_context && m_context->makeCurrent(m_surface.get());
+    }
+    void doneCurrent()
+    {
+        if (m_context)
+            m_context->doneCurrent();
+    }
+    stereo_dibr_gl *gl() const { return m_gl; }
+    bool isEs() const { return m_context && m_context->isOpenGLES(); }
+
+    // The views of a picture and its depth map into result (RGBA 8 bit, twice the picture's
+    // width), in the current context. parts are the picture and its depth map (stereo_dibr_unpack()
+    // of the frame, turned as the frame asks), dparts the same for the depth component of the
+    // frame. Returns false with the reason.
+    bool draw(Source source, bool fullRange, int colorSpace, const stereo_dibr_parts &parts,
+              const stereo_dibr_parts &dparts, const stereo_dibr_params &prm, const float *table,
+              int tableSize, const float *layerTable, QVideoFrame *result, QString *why)
+    {
+        const int vw = parts.picture.width, vh = parts.picture.height;
+        while (m_f->glGetError() != 0) { }
+        if (!picture(source, fullRange, colorSpace, parts.picture, Pic) ||
+            !depth(source, dparts.depth, Depth)) {
+            *why = QStringLiteral("a plane could not be uploaded");
+            return false;
+        }
+        const bool layered = parts.layer.width != 0;
+        if (layered
+            && (!picture(source, fullRange, colorSpace, parts.layer, LayerPic)
+                || !depth(source, dparts.layer_depth, LayerDepth))) {
+            *why = QStringLiteral("a layer could not be uploaded");
+            return false;
+        }
+        makeTexture(Target, vw * 2, vh, GL_RGBA8_, GL_RGBA_);
+        const float hole[4] = { 0.f, 0.f, 0.f, 1.f };
+        int r;
+        if (layered)
+            r = stereo_dibr_gl_render_layer(m_gl, &prm, table, tableSize, m_tex[Pic].id, vw, vh,
+                                            m_tex[Depth].id, dparts.depth.width,
+                                            dparts.depth.height, 0, parts.layer_role,
+                                            m_tex[LayerPic].id, layerTable, tableSize,
+                                            m_tex[LayerDepth].id, dparts.layer_depth.width,
+                                            dparts.layer_depth.height, m_tex[Target].id, hole);
+        else
+            r = stereo_dibr_gl_render(m_gl, &prm, table, tableSize, m_tex[Pic].id, vw, vh,
+                                      m_tex[Depth].id, dparts.depth.width, dparts.depth.height, 0,
+                                      m_tex[Target].id, hole);
+        if (r < 0) {
+            *why = QString::fromLatin1(stereo_dibr_gl_error(m_gl));
+            if (why->isEmpty())
+                *why = QStringLiteral("the views could not be drawn");
+            return false;
+        }
+        // the views into the frame
+        m_f->glBindFramebuffer(GL_FRAMEBUFFER_, m_fbo);
+        m_f->glFramebufferTexture2D(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D_,
+                                    m_tex[Target].id, 0);
+        m_f->glPixelStorei(0x0D05 /* GL_PACK_ALIGNMENT */, 1);
+        m_f->glPixelStorei(GL_PACK_ROW_LENGTH_, result->bytesPerLine(0) / 4);
+        m_f->glReadPixels(0, 0, vw * 2, vh, GL_RGBA_, GL_UNSIGNED_BYTE_, result->bits(0));
+        m_f->glPixelStorei(GL_PACK_ROW_LENGTH_, 0);
+        if (m_f->glGetError() != 0) {
+            *why = QStringLiteral("the views could not be read back");
+            return false;
+        }
+        return true;
+    }
+
+private:
+    enum TexId { Y, U, V, Raw, Pic, Depth, Target, LayerPic, LayerDepth, NbTextures };
+    struct Tex
+    {
+        unsigned id = 0;
+        int w = 0, h = 0;
+        unsigned internal = 0;
+    };
+
+    bool fail(const QString &why, QString *out)
+    {
+        m_whyNot = why;
+        m_failedThread = m_thread;
+        *out = why;
+        destroy();
+        return false;
+    }
+
+    void destroy()
+    {
+        if (m_context && m_surface && m_context->makeCurrent(m_surface.get())) {
+            g_depthContext = m_context.get();
+            if (m_gl)
+                stereo_dibr_gl_free(m_gl);
+            for (Tex &t : m_tex)
+                if (t.id)
+                    m_f->glDeleteTextures(1, &t.id);
+            if (m_vao)
+                m_f->glDeleteVertexArrays(1, &m_vao);
+            if (m_fbo)
+                m_f->glDeleteFramebuffers(1, &m_fbo);
+            if (m_convert)
+                m_f->glDeleteProgram(m_convert);
+            if (m_channel)
+                m_f->glDeleteProgram(m_channel);
+            m_context->doneCurrent();
+        }
+        m_gl = nullptr;
+        m_tex = {};
+        m_vao = m_fbo = m_convert = m_channel = 0;
+        m_surface.reset();
+        m_context.reset();
+        m_f = nullptr;
+    }
+
+    unsigned compile(unsigned type, const char *body)
+    {
+        const QByteArray prefix = m_context->isOpenGLES()
+                ? QByteArrayLiteral("#version 300 es\nprecision highp float;\nprecision highp int;\n"
+                                    "precision highp sampler2D;\n")
+                : QByteArrayLiteral("#version 330 core\n");
+        const QByteArray source = prefix + body;
+        const char *text = source.constData();
+        const unsigned shader = m_f->glCreateShader(type);
+        m_f->glShaderSource(shader, 1, &text, nullptr);
+        m_f->glCompileShader(shader);
+        int ok = 0;
+        m_f->glGetShaderiv(shader, 0x8B81 /* GL_COMPILE_STATUS */, &ok);
+        if (!ok) {
+            char log[400] = {};
+            m_f->glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
+            qCWarning(qLcVideoDepth) << "a pass that reads a frame does not compile:" << log;
+            m_f->glDeleteShader(shader);
+            return 0;
+        }
+        return shader;
+    }
+
+    unsigned program(const char *fragment)
+    {
+        const unsigned vs = compile(0x8B31 /* GL_VERTEX_SHADER */, kVertex);
+        const unsigned fs = vs ? compile(0x8B30 /* GL_FRAGMENT_SHADER */, fragment) : 0;
+        if (!vs || !fs)
+            return 0;
+        const unsigned prog = m_f->glCreateProgram();
+        m_f->glAttachShader(prog, vs);
+        m_f->glAttachShader(prog, fs);
+        m_f->glLinkProgram(prog);
+        m_f->glDeleteShader(vs);
+        m_f->glDeleteShader(fs);
+        int ok = 0;
+        m_f->glGetProgramiv(prog, 0x8B82 /* GL_LINK_STATUS */, &ok);
+        if (!ok) {
+            m_f->glDeleteProgram(prog);
+            return 0;
+        }
+        return prog;
+    }
+
+    bool buildPrograms()
+    {
+        m_convert = program(kConvert);
+        m_channel = program(kChannel);
+        return m_convert && m_channel;
+    }
+
+    void makeTexture(TexId id, int w, int h, unsigned internal, unsigned format)
+    {
+        Tex &t = m_tex[id];
+        if (!t.id)
+            m_f->glGenTextures(1, &t.id);
+        m_f->glBindTexture(GL_TEXTURE_2D_, t.id);
+        if (t.w != w || t.h != h || t.internal != internal) {
+            m_f->glTexImage2D(GL_TEXTURE_2D_, 0, int(internal), w, h, 0, format, GL_UNSIGNED_BYTE_,
+                              nullptr);
+            m_f->glTexParameteri(GL_TEXTURE_2D_, 0x2801 /* MIN_FILTER */, 0x2600 /* NEAREST */);
+            m_f->glTexParameteri(GL_TEXTURE_2D_, 0x2800 /* MAG_FILTER */, 0x2600);
+            m_f->glTexParameteri(GL_TEXTURE_2D_, 0x2802 /* WRAP_S */, 0x812F /* CLAMP_TO_EDGE */);
+            m_f->glTexParameteri(GL_TEXTURE_2D_, 0x2803 /* WRAP_T */, 0x812F);
+            t.w = w;
+            t.h = h;
+            t.internal = internal;
+        }
+    }
+
+    // A plane of w x h samples of bytes each, row to row stride bytes apart, into texture id
+    bool upload(TexId id, int w, int h, int bytes, const void *data, ptrdiff_t stride)
+    {
+        if (!data || stride <= 0 || w <= 0 || h <= 0)
+            return false;
+        const unsigned internal = bytes == 1 ? GL_R8_ : bytes == 2 ? GL_RG8_ : GL_RGBA8_;
+        const unsigned format = bytes == 1 ? GL_RED_ : bytes == 2 ? GL_RG_ : GL_RGBA_;
+        makeTexture(id, w, h, internal, format);
+        m_f->glPixelStorei(0x0CF5 /* GL_UNPACK_ALIGNMENT */, 1);
+        if (stride % bytes == 0) {
+            m_f->glPixelStorei(GL_UNPACK_ROW_LENGTH_, int(stride / bytes));
+            m_f->glTexSubImage2D(GL_TEXTURE_2D_, 0, 0, 0, w, h, format, GL_UNSIGNED_BYTE_, data);
+            m_f->glPixelStorei(GL_UNPACK_ROW_LENGTH_, 0);
+        } else {
+            std::vector<uint8_t> rows(size_t(w) * bytes * h);
+            for (int y = 0; y < h; ++y)
+                std::memcpy(rows.data() + size_t(y) * w * bytes,
+                            static_cast<const uint8_t *>(data) + y * stride, size_t(w) * bytes);
+            m_f->glTexSubImage2D(GL_TEXTURE_2D_, 0, 0, 0, w, h, format, GL_UNSIGNED_BYTE_,
+                                 rows.data());
+        }
+        return true;
+    }
+
+    void pass(unsigned prog, TexId out, int w, int h)
+    {
+        m_f->glBindFramebuffer(GL_FRAMEBUFFER_, m_fbo);
+        m_f->glFramebufferTexture2D(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D_,
+                                    m_tex[out].id, 0);
+        m_f->glViewport(0, 0, w, h);
+        m_f->glDisable(0x0BE2 /* BLEND */);
+        m_f->glDisable(0x0C11 /* SCISSOR_TEST */);
+        m_f->glUseProgram(prog);
+        m_f->glBindVertexArray(m_vao);
+        m_f->glDrawArrays(0x0004 /* TRIANGLES */, 0, 3);
+    }
+
+    void bindTexture(int unit, TexId id, unsigned prog, const char *name)
+    {
+        m_f->glActiveTexture(0x84C0 + unit);
+        m_f->glBindTexture(GL_TEXTURE_2D_, m_tex[id].id);
+        m_f->glUniform1i(m_f->glGetUniformLocation(prog, name), unit);
+    }
+
+    // One picture (or layer) of a frame into the RGBA texture out
+    bool picture(Source source, bool fullRange, int colorSpace, const stereo_dibr_picture &pic,
+                 TexId out)
+    {
+        const int w = pic.width, h = pic.height;
+        if (source == Source::Rgba) // stored as RGBA: the texture is the picture
+            return upload(out, w, h, 4, pic.plane[0].data, pic.plane[0].stride);
+        const stereo_dibr_plane &py = pic.plane[0], &pu = pic.plane[1];
+        const int cw = (w + (1 << pu.log2_w) - 1) >> pu.log2_w;
+        const int ch = (h + (1 << pu.log2_h) - 1) >> pu.log2_h;
+        if (!upload(Y, w, h, 1, py.data, py.stride))
+            return false;
+        if (source == Source::Planar) {
+            const stereo_dibr_plane &pv = pic.plane[2];
+            if (!upload(U, cw, ch, 1, pu.data, pu.stride) || !upload(V, cw, ch, 1, pv.data, pv.stride))
+                return false;
+        } else if (!upload(U, cw, ch, 2, pu.data, pu.stride)) {
+            return false;
+        }
+        makeTexture(out, w, h, GL_RGBA8_, GL_RGBA_);
+        m_f->glUseProgram(m_convert);
+        bindTexture(0, Y, m_convert, "u_y");
+        bindTexture(1, U, m_convert, "u_u");
+        bindTexture(2, source == Source::Planar ? V : U, m_convert, "u_v");
+        m_f->glUniform1i(m_f->glGetUniformLocation(m_convert, "u_mode"),
+                         source == Source::Planar ? 0 : source == Source::SemiUV ? 1 : 2);
+        m_f->glUniform2i(m_f->glGetUniformLocation(m_convert, "u_shift"), pu.log2_w, pu.log2_h);
+        float kr = 0.299f, kb = 0.114f;
+        if (colorSpace == 1) {
+            kr = 0.2126f;
+            kb = 0.0722f;
+        } else if (colorSpace == 2) {
+            kr = 0.2627f;
+            kb = 0.0593f;
+        }
+        m_f->glUniform2f(m_f->glGetUniformLocation(m_convert, "u_k"), kr, kb);
+        m_f->glUniform1i(m_f->glGetUniformLocation(m_convert, "u_full"), fullRange ? 1 : 0);
+        pass(m_convert, out, w, h);
+        return true;
+    }
+
+    // The depth map of a picture: the luma plane as it is, or one channel of an RGBA picture
+    bool depth(Source source, const stereo_dibr_depth &d, TexId out)
+    {
+        if (d.bytes == 4 && source == Source::Rgba) {
+            if (!upload(Raw, d.width, d.height, 4, d.data, d.stride))
+                return false;
+            makeTexture(out, d.width, d.height, GL_R8_, GL_RED_);
+            m_f->glUseProgram(m_channel);
+            bindTexture(0, Raw, m_channel, "u_y");
+            m_f->glUniform1i(m_f->glGetUniformLocation(m_channel, "u_channel"), 1);
+            pass(m_channel, out, d.width, d.height);
+            return true;
+        }
+        if (d.bytes != 1)
+            return false;
+        return upload(out, d.width, d.height, 1, d.data, d.stride);
+    }
+
+    std::unique_ptr<QOpenGLContext> m_context;
+    std::unique_ptr<QOffscreenSurface> m_surface;
+    QOpenGLExtraFunctions *m_f = nullptr;
+    QThread *m_thread = nullptr, *m_failedThread = nullptr;
+    QString m_whyNot;
+    stereo_dibr_gl *m_gl = nullptr;
+    QThread m_worker;
+    QObject m_executor;
+    std::array<Tex, NbTextures> m_tex;
+    unsigned m_vao = 0, m_fbo = 0, m_convert = 0, m_channel = 0;
+};
+
+#endif // QT_MM_DEPTH_GPU
+
 } // namespace
 
 struct Renderer::Private
 {
+    enum class Outcome { Drawn, PictureAlone, Failed, GpuFailed };
+
     stereo_dibr *dibr = nullptr;
     std::vector<float> table, layerTable;
     std::vector<uint16_t> lut;
+#ifdef QT_MM_DEPTH_GPU
+    GpuDrawer gpu;
+#endif
+    // what the automatic way chose for the last frame, and where it was drawn
+    Choice choice;
+    bool onGpu = false;
+    // the times of the ways on the engine that draws, for the size drawn
+    struct Timing
+    {
+        bool ok = false;
+        bool gpu = false;
+        QString key;
+        int w = 0, h = 0;
+        std::vector<double> ms;
+    } timing;
+    // what the log was told last, so that it says it when it changes and not for every frame
+    QString said;
+
     ~Private() { stereo_dibr_free(dibr); }
+
+    void say(const QString &where, bool warning)
+    {
+        if (said == where)
+            return;
+        said = where;
+        if (warning)
+            qCWarning(qLcVideoDepth).noquote() << where;
+        else
+            qCInfo(qLcVideoDepth).noquote() << where;
+    }
 
     // 1: read, 0: malformed (one picture), -1: error
     int readMark(const QString &text, int bits, stereo_depth_convention *c)
@@ -431,22 +968,117 @@ struct Renderer::Private
             return readMark(fileMark, bits, c);
         return 1;
     }
+
+    // The way to draw with: the person's, or the first way of libstereo-dibr's ladder that keeps
+    // up with the video's frame rate on the engine that draws, from its times at this size (timed
+    // once for each GPU and size and kept in the person's cache). The engine's context is current
+    // for the GPU. Returns false when the ways cannot be timed.
+    bool chooseWay(const Options &o, bool gpuEngine, int w, int h, double fps, int *warp, int *fill)
+    {
+        if (!o.automatic) {
+            choice = {};
+            *warp = o.warp;
+            *fill = o.fill;
+            return true;
+        }
+        const int n = stereo_dibr_ways(nullptr, 0);
+        QString key = QStringLiteral("cpu");
+#ifdef QT_MM_DEPTH_GPU
+        if (gpuEngine)
+            key = QString::fromLatin1(stereo_dibr_gl_gpu(gpu.gl()));
+#endif
+        if (!timing.ok || timing.gpu != gpuEngine || timing.key != key || timing.w != w
+            || timing.h != h) {
+            std::vector<double> ms(size_t(n), -1.0);
+            int measured = 0, r = -1;
+#ifdef QT_MM_DEPTH_GPU
+            if (gpuEngine)
+                r = stereo_dibr_gl_measure(gpu.gl(), w, h, 1, ms.data(), n, &measured);
+#endif
+            if (!gpuEngine)
+                r = stereo_dibr_measure_cpu(w, h, ms.data(), n, &measured);
+            if (r < 0)
+                return false;
+            timing = { true, gpuEngine, key, w, h, ms };
+            QStringList times;
+            for (double t : ms)
+                times << QString::number(t, 'f', 1);
+            qCInfo(qLcVideoDepth).noquote()
+                    << (measured ? QStringLiteral("timed") : QStringLiteral("took from the cache"))
+                    << "the ways of drawing the views of a depth video on" << key << "at" << w << "x"
+                    << h << "(ms a frame, best way first):" << times.join(QStringLiteral(" "));
+        }
+        stereo_dibr_choice c;
+        if (stereo_dibr_choose_from_times(timing.ms.data(), n, fps, &c) < 0)
+            return false;
+        choice.valid = true;
+        choice.warp = c.warp;
+        choice.fill = c.fill;
+        choice.keepsUp = c.keeps_up != 0;
+        choice.fps = fps;
+        choice.ms = c.ms;
+        choice.budgetMs = c.budget_ms;
+        choice.skippedWarp = c.skipped_warp;
+        choice.skippedFill = c.skipped_fill;
+        choice.skippedMs = c.skipped_ms;
+        choice.onGpu = gpuEngine;
+        choice.gpu = key;
+        *warp = c.warp;
+        *fill = c.fill;
+        return true;
+    }
+
+    Outcome render(const QVideoFrame &input, Mode mode, bool depthFirst, const QString &fileMark,
+                   const Options &options, bool useGpu, QVideoFrame *out, QString *why);
 };
 
-Renderer::Renderer() : d(std::make_unique<Private>())
+namespace {
+
+// The pixel formats the GPU reads as they are: 8 bit planar and semi-planar YUV, and RGBA as
+// stored (the frames of hardware decoders and of other formats arrive as RGBA 8 bit images)
+#ifdef QT_MM_DEPTH_GPU
+bool gpuSourceOf(PixelFormat format, GpuDrawer::Source *source)
 {
-    d->dibr = stereo_dibr_alloc();
+    switch (format) {
+    case PixelFormat::Format_YUV420P:
+    case PixelFormat::Format_YV12:
+    case PixelFormat::Format_YUV422P:
+    case PixelFormat::Format_YUV444P:
+        *source = GpuDrawer::Source::Planar;
+        return true;
+    case PixelFormat::Format_NV12:
+        *source = GpuDrawer::Source::SemiUV;
+        return true;
+    case PixelFormat::Format_NV21:
+        *source = GpuDrawer::Source::SemiVU;
+        return true;
+    case PixelFormat::Format_RGBA8888:
+        *source = GpuDrawer::Source::Rgba;
+        return true;
+    default:
+        return false;
+    }
+}
+#endif
+
+// The frame rate of a video: what the stream says, else what its frames' times say, else 30 (said)
+double frameRateOf(const QVideoFrame &frame, bool *known)
+{
+    double fps = frame.surfaceFormat().streamFrameRate();
+    if (fps <= 0.0 && frame.endTime() > frame.startTime())
+        fps = 1e6 / double(frame.endTime() - frame.startTime());
+    *known = fps > 0.0 && fps < 1000.0;
+    return *known ? fps : 30.0;
 }
 
-Renderer::~Renderer() = default;
+} // namespace
 
-Renderer::Result Renderer::draw(const QVideoFrame &input, Mode mode, bool depthFirst,
-                                const QString &fileMark, const Options &options, QVideoFrame *out)
+Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, Mode mode,
+                                                     bool depthFirst, const QString &fileMark,
+                                                     const Options &options, bool useGpu,
+                                                     QVideoFrame *out, QString *why)
 {
     const int packing = packingOf(mode);
-    if (packing < 0 || !d->dibr || !input.isValid())
-        return Result::Failed;
-
     QVideoFrame frame = input;
     Layout l;
     if (!layoutOf(frame.pixelFormat(), &l)) {
@@ -455,13 +1087,25 @@ Renderer::Result Renderer::draw(const QVideoFrame &input, Mode mode, bool depthF
         const QImage image =
                 qImageFromVideoFrame(frame, VideoTransformation{}, QVideoFrameImageDepth::Bits8);
         if (image.isNull())
-            return Result::Failed;
+            return Outcome::Failed;
         frame = QVideoFrame(image.convertToFormat(QImage::Format_RGBA8888));
         if (!layoutOf(frame.pixelFormat(), &l))
-            return Result::Failed;
+            return Outcome::Failed;
     }
+#ifdef QT_MM_DEPTH_GPU
+    GpuDrawer::Source source = GpuDrawer::Source::Planar;
+    if (useGpu && (l.bits != 8 || !gpuSourceOf(frame.pixelFormat(), &source))) {
+        *why = QStringLiteral("the pixel format %1 is not one the GPU reads")
+                       .arg(QVideoFrameFormat::pixelFormatToString(frame.pixelFormat()));
+        return Outcome::GpuFailed;
+    }
+#else
+    Q_UNUSED(why);
+    if (useGpu)
+        return Outcome::GpuFailed;
+#endif
     if (!frame.map(QVideoFrame::ReadOnly))
-        return Result::Failed;
+        return Outcome::Failed;
 
     const int w = frame.width(), h = frame.height();
     const bool fullRange = frame.surfaceFormat().colorRange() == QVideoFrameFormat::ColorRange_Full
@@ -473,20 +1117,43 @@ Renderer::Result Renderer::draw(const QVideoFrame &input, Mode mode, bool depthF
         inStrides[p] = frame.bytesPerLine(p);
     }
     std::vector<PlaneData> inPlanes;
-    for (int c = 0; c < l.count; ++c)
-        inPlanes.push_back(componentPlane(inBits, inStrides, l, c, w, h));
     stereo_dibr_picture whole;
-    fillPicture(&whole, inPlanes, l, w, h, fullRange);
-    // the depth samples are the first plane of a picture of the depth component alone
-    stereo_dibr_picture depthWhole = whole;
-    depthWhole.nb_planes = 1;
-    depthWhole.plane[0] = whole.plane[l.depthComponent];
+    stereo_dibr_picture depthWhole;
+    if (useGpu) {
+        // the planes as they are: the GPU reads the interleaved chroma of NV12 and RGBA whole
+        std::memset(&whole, 0, sizeof(whole));
+        whole.width = w;
+        whole.height = h;
+        whole.plane[0] = { inBits[0], inStrides[0], l.bytes, 0, 0, 0 };
+        if (l.semiPlanar) {
+            whole.nb_planes = 2;
+            whole.plane[1] = { inBits[1], inStrides[1], 2, 1, 1, 0 };
+        } else if (l.c[0].kind == Component::Color) {
+            whole.nb_planes = 1;
+            whole.plane[0].bytes = 4;
+        } else {
+            whole.nb_planes = 3;
+            for (int c = 1; c < 3; ++c)
+                whole.plane[c] = { inBits[l.c[c].plane], inStrides[l.c[c].plane], 1,
+                                   l.c[c].log2w, l.c[c].log2h, 0 };
+        }
+        depthWhole = whole;
+        depthWhole.nb_planes = 1;
+    } else {
+        for (int c = 0; c < l.count; ++c)
+            inPlanes.push_back(componentPlane(inBits, inStrides, l, c, w, h));
+        fillPicture(&whole, inPlanes, l, w, h, fullRange);
+        // the depth samples are the first plane of a picture of the depth component alone
+        depthWhole = whole;
+        depthWhole.nb_planes = 1;
+        depthWhole.plane[0] = whole.plane[l.depthComponent];
+    }
 
     stereo_dibr_parts parts, depthParts;
     if (stereo_dibr_unpack(&whole, packing, depthFirst, 0, &parts) < 0
         || stereo_dibr_unpack(&depthWhole, packing, depthFirst, 0, &depthParts) < 0) {
         frame.unmap();
-        return Result::Failed;
+        return Outcome::Failed;
     }
 
     // A video recorded sideways or upside down: the picture and its depth map are turned as the
@@ -508,20 +1175,37 @@ Renderer::Result Renderer::draw(const QVideoFrame &input, Mode mode, bool depthF
     const int vw = parts.picture.width, vh = parts.picture.height;
 
     stereo_depth_convention c;
-    const int known = d->convention(fileMark, options, l.bits, &c);
+    const int known = convention(fileMark, options, l.bits, &c);
     if (known <= 0) {
         frame.unmap();
-        return known == 0 ? Result::PictureAlone : Result::Failed;
+        return known == 0 ? Outcome::PictureAlone : Outcome::Failed;
     }
     const size_t tableSize = size_t(1) << l.bits;
-    d->table.resize(tableSize);
-    if (stereo_depth_parallax_table(&c, vw, d->table.data()) < 0) {
+    table.resize(tableSize);
+    if (stereo_depth_parallax_table(&c, vw, table.data()) < 0) {
         frame.unmap();
-        return Result::Failed;
+        return Outcome::Failed;
+    }
+    layerTable.clear();
+    if (parts.layer.width) {
+        // a layer's 0 is nothing there (docs/depth-marks.md)
+        layerTable = table;
+        layerTable[0] = NAN;
     }
 
-    // the output: the same pixel format and color, twice the picture's width
+    // the output: the views at the picture's size, side by side
     QVideoFrameFormat format = frame.surfaceFormat();
+    if (useGpu) {
+        // RGBA 8 bit, drawn by the GPU
+        const QVideoFrameFormat from = format;
+        format = QVideoFrameFormat(QSize(2 * vw, vh), PixelFormat::Format_RGBA8888);
+        format.setColorSpace(from.colorSpace());
+        format.setColorTransfer(from.colorTransfer());
+        format.setColorRange(QVideoFrameFormat::ColorRange_Full);
+        format.setStreamFrameRate(from.streamFrameRate());
+        format.setPixelAspectRatio(from.pixelAspectRatio());
+        format.setMaxLuminance(from.maxLuminance());
+    }
     format.setFrameSize(QSize(2 * vw, vh));
     format.setViewport(QRect(0, 0, 2 * vw, vh));
     format.setStereoMode(Mode::SideBySide);
@@ -538,8 +1222,63 @@ Renderer::Result Renderer::draw(const QVideoFrame &input, Mode mode, bool depthF
     QVideoFrame result(format);
     if (!result.map(QVideoFrame::WriteOnly)) {
         frame.unmap();
-        return Result::Failed;
+        return Outcome::Failed;
     }
+
+    bool knownRate = false;
+    const double fps = frameRateOf(input, &knownRate);
+    stereo_dibr_params prm;
+    stereo_dibr_params_default(&prm);
+    prm.view = options.view;
+    prm.warp = options.warp;
+    prm.fill = options.fill;
+    prm.smooth = options.smooth;
+    prm.sigma_h = options.sigmaH;
+    prm.sigma_v = options.sigmaV;
+    prm.radius = options.radius;
+
+#ifdef QT_MM_DEPTH_GPU
+    if (useGpu) {
+        bool ok = false;
+        QString reason;
+        gpu.run([&] {
+            ok = gpu.makeCurrent();
+            if (!ok)
+                reason = QStringLiteral("the OpenGL context could not be made current");
+            if (ok && !chooseWay(options, true, vw, vh, fps, &prm.warp, &prm.fill)) {
+                ok = false;
+                reason = QStringLiteral("the ways of drawing could not be timed on the GPU");
+            }
+            if (ok)
+                ok = gpu.draw(source, fullRange,
+                              frame.surfaceFormat().colorSpace()
+                                      == QVideoFrameFormat::ColorSpace_BT709
+                                      ? 1
+                                      : frame.surfaceFormat().colorSpace()
+                                              == QVideoFrameFormat::ColorSpace_BT2020
+                                              ? 2
+                                              : 0,
+                              parts, depthParts, prm, table.data(), int(tableSize),
+                              layerTable.empty() ? nullptr : layerTable.data(), &result, &reason);
+            gpu.doneCurrent();
+        });
+        result.unmap();
+        frame.unmap();
+        if (!ok) {
+            *why = reason;
+            return Outcome::GpuFailed;
+        }
+        onGpu = true;
+        if (choice.valid && !knownRate)
+            choice.fps = fps;
+        result.setStartTime(input.startTime());
+        result.setEndTime(input.endTime());
+        *out = result;
+        return Outcome::Drawn;
+    }
+#endif
+
+    // the C code, on the processor
     uchar *outBits[4] = {};
     int outStrides[4] = {};
     for (int p = 0; p < result.planeCount() && p < 4; ++p) {
@@ -560,26 +1299,19 @@ Renderer::Result Renderer::draw(const QVideoFrame &input, Mode mode, bool depthF
                 static_cast<uint8_t *>(outWhole.plane[cc].data) + ptrdiff_t(cx) * l.bytes;
     }
 
-    stereo_dibr_params prm;
-    stereo_dibr_params_default(&prm);
-    prm.view = options.view;
-    prm.warp = options.warp;
-    prm.fill = options.fill;
-    prm.smooth = options.smooth;
-    prm.sigma_h = options.sigmaH;
-    prm.sigma_v = options.sigmaV;
-    prm.radius = options.radius;
+    if (!chooseWay(options, false, vw, vh, fps, &prm.warp, &prm.fill)) {
+        result.unmap();
+        frame.unmap();
+        return Outcome::Failed;
+    }
     int r;
     if (parts.layer.width) {
-        // a layer's 0 is nothing there (docs/depth-marks.md)
-        d->layerTable = d->table;
-        d->layerTable[0] = NAN;
-        r = stereo_dibr_render_layer(d->dibr, &prm, d->table.data(), int(tableSize), &parts.picture,
+        r = stereo_dibr_render_layer(dibr, &prm, table.data(), int(tableSize), &parts.picture,
                                      &depthParts.depth, parts.layer_role, &parts.layer,
-                                     d->layerTable.data(), int(tableSize), &depthParts.layer_depth,
+                                     layerTable.data(), int(tableSize), &depthParts.layer_depth,
                                      &left, &right);
     } else {
-        r = stereo_dibr_render(d->dibr, &prm, d->table.data(), int(tableSize), &parts.picture,
+        r = stereo_dibr_render(dibr, &prm, table.data(), int(tableSize), &parts.picture,
                                &depthParts.depth, &left, &right);
     }
     for (int cc = 0; cc < l.count; ++cc)
@@ -587,11 +1319,84 @@ Renderer::Result Renderer::draw(const QVideoFrame &input, Mode mode, bool depthF
     result.unmap();
     frame.unmap();
     if (r < 0)
-        return Result::Failed;
+        return Outcome::Failed;
+    onGpu = false;
     result.setStartTime(input.startTime());
     result.setEndTime(input.endTime());
     *out = result;
-    return Result::Drawn;
+    return Outcome::Drawn;
+}
+
+Renderer::Renderer() : d(std::make_unique<Private>())
+{
+    d->dibr = stereo_dibr_alloc();
+}
+
+Renderer::~Renderer() = default;
+
+Choice Renderer::choice() const
+{
+    return d->choice;
+}
+
+bool Renderer::lastOnGpu() const
+{
+    return d->onGpu;
+}
+
+Renderer::Result Renderer::draw(const QVideoFrame &input, Mode mode, bool depthFirst,
+                                const QString &fileMark, const Options &options, QVideoFrame *out)
+{
+    if (packingOf(mode) < 0 || !d->dibr || !input.isValid())
+        return Result::Failed;
+
+    // Where the views are drawn: on the GPU when it can and the person has not asked for the
+    // processor; the C code on the processor otherwise, which the log says (it is a route of the
+    // design, never a silent one)
+    QString cpuReason;
+    bool tryGpu = false;
+#ifdef QT_MM_DEPTH_GPU
+    if (!options.gpu) {
+        cpuReason = QStringLiteral("the processor was asked for");
+    } else {
+        QString why;
+        bool made = false;
+        d->gpu.run([&] { made = d->gpu.ensure(&why); });
+        if (made)
+            tryGpu = true;
+        else
+            cpuReason = why;
+    }
+#else
+    cpuReason = QStringLiteral("this Qt Multimedia has no OpenGL");
+#endif
+    Private::Outcome o = Private::Outcome::GpuFailed;
+    if (tryGpu) {
+        QString why;
+        o = d->render(input, mode, depthFirst, fileMark, options, true, out, &why);
+        if (o == Private::Outcome::GpuFailed)
+            cpuReason = why;
+        else if (o == Private::Outcome::Drawn)
+            d->say(QStringLiteral("the views of a depth video are drawn on the GPU: %1")
+                           .arg(d->choice.valid ? d->choice.gpu : QStringLiteral("the way is the person's")),
+                   false);
+    }
+    if (o == Private::Outcome::GpuFailed) {
+        d->say(QStringLiteral("the views of a depth video are drawn by the C code on the processor, "
+                              "not on the GPU: %1")
+                       .arg(cpuReason),
+               true);
+        QString why;
+        o = d->render(input, mode, depthFirst, fileMark, options, false, out, &why);
+    }
+    switch (o) {
+    case Private::Outcome::Drawn:
+        return Result::Drawn;
+    case Private::Outcome::PictureAlone:
+        return Result::PictureAlone;
+    default:
+        return Result::Failed;
+    }
 }
 
 #else
@@ -603,6 +1408,16 @@ struct Renderer::Private
 Renderer::Renderer() : d(std::make_unique<Private>()) { }
 
 Renderer::~Renderer() = default;
+
+Choice Renderer::choice() const
+{
+    return {};
+}
+
+bool Renderer::lastOnGpu() const
+{
+    return false;
+}
 
 Renderer::Result Renderer::draw(const QVideoFrame &, Mode, bool, const QString &, const Options &,
                                 QVideoFrame *)

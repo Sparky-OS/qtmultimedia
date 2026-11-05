@@ -821,10 +821,12 @@ void QQuickVideoOutput::setStereoDepthView(StereoDepthView value)
 /*!
     \qmlproperty enumeration QtMultimedia::VideoOutput::stereoDepthWarp
 
-    How the picture is warped into a view: \c StereoDepthForward (the default) moves each pixel of
+    How the picture is warped into a view: \c StereoDepthForward moves each pixel of
     the picture to its place in the view, \c StereoDepthBackward warps the depth first and then
     takes each pixel of the view from the picture, \c StereoDepthLayered draws the edges of near
-    objects as a layer over the rest.
+    objects as a layer over the rest. The default is libstereo-dibr's, the same for every
+    program, and while \l stereoDepthAutomatic is \c true the way is chosen for the video:
+    setting this picks the warping and turns that off.
 */
 QQuickVideoOutput::StereoDepthWarp QQuickVideoOutput::stereoDepthWarp() const
 {
@@ -834,23 +836,38 @@ QQuickVideoOutput::StereoDepthWarp QQuickVideoOutput::stereoDepthWarp() const
 
 void QQuickVideoOutput::setStereoDepthWarp(StereoDepthWarp value)
 {
+    // picking a warping is picking the way: the way is the program's, not the automatic one
+    bool changed = false, automaticChanged = false;
     {
         QMutexLocker lock(&m_frameMutex);
-        if (m_stereo.depth.warp == int(value))
-            return;
-        m_stereo.depth.warp = int(value);
+        if (m_stereo.depth.warp != int(value)) {
+            m_stereo.depth.warp = int(value);
+            changed = true;
+        }
+        if (m_stereo.depth.automatic) {
+            m_stereo.depth.automatic = false;
+            automaticChanged = true;
+        }
     }
-    emit stereoDepthWarpChanged();
-    reprocessFrame();
+    if (automaticChanged)
+        emit stereoDepthAutomaticChanged();
+    if (changed)
+        emit stereoDepthWarpChanged();
+    if (changed || automaticChanged)
+        reprocessFrame();
 }
 
 /*!
     \qmlproperty enumeration QtMultimedia::VideoOutput::stereoDepthFill
 
     How the areas each view sees behind near objects, which the picture does not show, are filled:
-    \c StereoDepthFillBackground (the default) extends the background, \c StereoDepthFillDepth takes
-    background pixels only, \c StereoDepthFillTelea inpaints from the background side (Telea),
-    \c StereoDepthFillNone leaves them black.
+    \c StereoDepthFillBackground extends the background, \c StereoDepthFillDepth takes
+    background pixels only, \c StereoDepthFillPyramid does the same by halves of the picture, in a
+    number of steps that grows with the logarithm of the hole (about the error of
+    \c StereoDepthFillDepth at a seventh of its time on a GPU), \c StereoDepthFillTelea inpaints
+    from the background side (Telea), \c StereoDepthFillNone leaves them black. The default is
+    libstereo-dibr's, the same for every program, and while \l stereoDepthAutomatic is \c true
+    the way is chosen for the video: setting this picks the fill and turns that off.
 */
 QQuickVideoOutput::StereoDepthFill QQuickVideoOutput::stereoDepthFill() const
 {
@@ -860,14 +877,25 @@ QQuickVideoOutput::StereoDepthFill QQuickVideoOutput::stereoDepthFill() const
 
 void QQuickVideoOutput::setStereoDepthFill(StereoDepthFill value)
 {
+    // picking a gap filling is picking the way: the way is the program's, not the automatic one
+    bool changed = false, automaticChanged = false;
     {
         QMutexLocker lock(&m_frameMutex);
-        if (m_stereo.depth.fill == int(value))
-            return;
-        m_stereo.depth.fill = int(value);
+        if (m_stereo.depth.fill != int(value)) {
+            m_stereo.depth.fill = int(value);
+            changed = true;
+        }
+        if (m_stereo.depth.automatic) {
+            m_stereo.depth.automatic = false;
+            automaticChanged = true;
+        }
     }
-    emit stereoDepthFillChanged();
-    reprocessFrame();
+    if (automaticChanged)
+        emit stereoDepthAutomaticChanged();
+    if (changed)
+        emit stereoDepthFillChanged();
+    if (changed || automaticChanged)
+        reprocessFrame();
 }
 
 /*!
@@ -1144,6 +1172,105 @@ void QQuickVideoOutput::setStereoDepthMark(const QString &value)
     }
     emit stereoDepthMarkChanged();
     reprocessFrame();
+}
+
+/*!
+    \qmlproperty bool QtMultimedia::VideoOutput::stereoDepthAutomatic
+
+    Whether the way the views are drawn (the warping and the gap filling) is chosen for the
+    video: the best way that keeps the frame rate of the video on the GPU that draws it, measured
+    once for each GPU and picture size and kept in the person's cache
+    (\c XDG_CACHE_HOME/stereo-dibr/timings, never in the media file). \l stereoDepthChoice says
+    what was chosen and why. The default value is \c true. Setting \l stereoDepthWarp or
+    \l stereoDepthFill picks the way and turns it off: the pick then holds for the video, the
+    slowest way included. Setting it \c true gives the way back to the choice.
+*/
+bool QQuickVideoOutput::stereoDepthAutomatic() const
+{
+    QMutexLocker lock(&m_frameMutex);
+    return m_stereo.depth.automatic;
+}
+
+void QQuickVideoOutput::setStereoDepthAutomatic(bool value)
+{
+    {
+        QMutexLocker lock(&m_frameMutex);
+        if (m_stereo.depth.automatic == value)
+            return;
+        m_stereo.depth.automatic = value;
+    }
+    emit stereoDepthAutomaticChanged();
+    reprocessFrame();
+}
+
+/*!
+    \qmlproperty bool QtMultimedia::VideoOutput::stereoDepthGpu
+
+    Whether the views are drawn on the GPU when the frame can be (OpenGL, libstereo-dibr's GLSL
+    passes, in a context on the GPU the process draws with); \c false draws them with the C code
+    on the processor. The processor also draws the frames the GPU does not read, 10 bit and
+    16 bit video among them, and when no OpenGL context can be made: the log of
+    \c qt.multimedia.video.depth says so, with the reason. The default value is \c true.
+*/
+bool QQuickVideoOutput::stereoDepthGpu() const
+{
+    QMutexLocker lock(&m_frameMutex);
+    return m_stereo.depth.gpu;
+}
+
+void QQuickVideoOutput::setStereoDepthGpu(bool value)
+{
+    {
+        QMutexLocker lock(&m_frameMutex);
+        if (m_stereo.depth.gpu == value)
+            return;
+        m_stereo.depth.gpu = value;
+    }
+    emit stereoDepthGpuChanged();
+    reprocessFrame();
+}
+
+/*!
+    \qmlproperty var QtMultimedia::VideoOutput::stereoDepthChoice
+
+    What the automatic way chose for the video that plays: a map with \c warp and \c fill (the
+    values of \l stereoDepthWarp and \l stereoDepthFill), \c keepsUp (whether it keeps the frame
+    rate), \c fps, \c ms and \c budgetMs (its slowest frames' time and the time a frame may
+    take), \c skippedWarp and \c skippedFill (the best way that does not keep up, -1 for none),
+    \c skippedMs, \c onGpu and \c gpu (the GPU's or the processor's name). Empty when no video
+    that carries depth is drawn or the way is the program's.
+*/
+QVariantMap QQuickVideoOutput::stereoDepthChoice() const
+{
+    QMutexLocker lock(&m_frameMutex);
+    return m_depthChoice;
+}
+
+void QQuickVideoOutput::setDepthChoice(const QQuickVideoDepth::Choice &choice)
+{
+    QVariantMap map;
+    if (choice.valid) {
+        map.insert(QStringLiteral("warp"), choice.warp);
+        map.insert(QStringLiteral("fill"), choice.fill);
+        map.insert(QStringLiteral("keepsUp"), choice.keepsUp);
+        map.insert(QStringLiteral("fps"), choice.fps);
+        map.insert(QStringLiteral("ms"), choice.ms);
+        map.insert(QStringLiteral("budgetMs"), choice.budgetMs);
+        map.insert(QStringLiteral("skippedWarp"), choice.skippedWarp);
+        map.insert(QStringLiteral("skippedFill"), choice.skippedFill);
+        map.insert(QStringLiteral("skippedMs"), choice.skippedMs);
+        map.insert(QStringLiteral("onGpu"), choice.onGpu);
+        map.insert(QStringLiteral("gpu"), choice.gpu);
+    }
+    {
+        QMutexLocker lock(&m_frameMutex);
+        if (m_depthChoice == map)
+            return;
+        m_depthChoice = map;
+    }
+    // from the thread of the video: the item's signal goes out from the item's thread
+    QMetaObject::invokeMethod(this, &QQuickVideoOutput::stereoDepthChoiceChanged,
+                              Qt::QueuedConnection);
 }
 
 /*!
@@ -1606,6 +1733,7 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
     QVideoFrame input = frame;
     StereoInput depthInput = StereoNone;
     QRectF depthPictureRect;
+    QQuickVideoDepth::Choice depthChoice;
     if (frame.isValid()) {
         const QVideoFrameFormat format = frame.surfaceFormat();
         Packing depth;
@@ -1627,6 +1755,7 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
                 if (drawResult == QQuickVideoDepth::Renderer::Result::Drawn) {
                     input = drawn;
                     alone = false;
+                    depthChoice = m_depthRenderer->choice();
                 } else if (drawResult == QQuickVideoDepth::Renderer::Result::Failed) {
                     qCDebug(qLcVideo)
                             << "the views of a picture with its depth map could not be drawn";
@@ -1642,6 +1771,7 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
             }
         }
     }
+    setDepthChoice(depthChoice);
     const bool depthDrawn =
             depthInput != StereoNone && depthPictureRect.isNull() && st.view != StereoFlat;
     shown = input;
