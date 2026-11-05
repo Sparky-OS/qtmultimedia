@@ -1277,6 +1277,43 @@ void QQuickVideoOutput::setDepthGpuMemory(const QQuickVideoDepth::GpuMemory &mem
     QMetaObject::invokeMethod(this, &QQuickVideoOutput::stereoDepthGpuMemoryChanged, Qt::QueuedConnection);
 }
 
+/*!
+    \qmlproperty var QtMultimedia::VideoOutput::stereoDepthRoute
+
+    How the frames of a video that carries depth travel while its views are drawn on the GPU: a map with \c frames (\c memory for
+    a frame in system memory, \c imported for a decoder's hardware frame the passes read where it is, \c copied for one read back to
+    system memory) and \c framesWhy (the reason for a copy), \c views (\c texture for views handed to the video sink as GPU
+    textures, \c readBack for views read back to system memory, \c memory for views drawn by the processor) and \c viewsWhy. Empty
+    when no views are drawn. \l stereoDepthReadBacks() counts the read backs.
+*/
+QVariantMap QQuickVideoOutput::stereoDepthRoute() const
+{
+    QMutexLocker lock(&m_frameMutex);
+    return m_depthRoute;
+}
+
+QVariantMap QQuickVideoOutput::stereoDepthReadBacks() const
+{
+    QMutexLocker lock(&m_depthMutex);
+    QVariantMap map;
+    if (m_depthRenderer) {
+        map.insert(QStringLiteral("frames"), m_depthRenderer->hardwareReadBacks());
+        map.insert(QStringLiteral("views"), m_depthRenderer->viewsReadBacks());
+    }
+    return map;
+}
+
+void QQuickVideoOutput::setDepthRoute(const QVariantMap &route)
+{
+    {
+        QMutexLocker lock(&m_frameMutex);
+        if (m_depthRoute == route)
+            return;
+        m_depthRoute = route;
+    }
+    QMetaObject::invokeMethod(this, &QQuickVideoOutput::stereoDepthRouteChanged, Qt::QueuedConnection);
+}
+
 void QQuickVideoOutput::setDepthChoice(const QQuickVideoDepth::Choice &choice)
 {
     QVariantMap map;
@@ -1767,6 +1804,7 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
     QRectF depthPictureRect;
     QQuickVideoDepth::Choice depthChoice;
     QQuickVideoDepth::GpuMemory depthMemory;
+    QVariantMap depthRoute;
     if (frame.isValid()) {
         const QVideoFrameFormat format = frame.surfaceFormat();
         Packing depth;
@@ -1782,6 +1820,8 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
                 QMutexLocker lock(&m_depthMutex);
                 if (!m_depthRenderer)
                     m_depthRenderer = std::make_unique<QQuickVideoDepth::Renderer>();
+                // the views are handed to the sink as textures when it draws with OpenGL: its RHI is the scene graph's
+                m_depthRenderer->setSinkRhi(m_window ? QQuickWindowPrivate::get(m_window)->rhi : nullptr);
                 const auto drawResult =
                         m_depthRenderer->draw(frame, depth.mode, depth.depthFirst,
                                               format.stereoDepthMark(), st.depth, &drawn);
@@ -1790,6 +1830,18 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
                     alone = false;
                     depthChoice = m_depthRenderer->choice();
                     depthMemory = m_depthRenderer->gpuMemory();
+                    if (m_depthRenderer->lastOnGpu()) {
+                        using FrameRoute = QQuickVideoDepth::Renderer::FrameRoute;
+                        using ViewsRoute = QQuickVideoDepth::Renderer::ViewsRoute;
+                        const FrameRoute fr = m_depthRenderer->lastFrameRoute();
+                        const ViewsRoute vr = m_depthRenderer->lastViewsRoute();
+                        depthRoute.insert(QStringLiteral("frames"), fr == FrameRoute::Imported ? QStringLiteral("imported")
+                                                  : fr == FrameRoute::Copied ? QStringLiteral("copied") : QStringLiteral("memory"));
+                        depthRoute.insert(QStringLiteral("framesWhy"), m_depthRenderer->lastFrameRouteWhy());
+                        depthRoute.insert(QStringLiteral("views"), vr == ViewsRoute::Texture ? QStringLiteral("texture")
+                                                  : vr == ViewsRoute::ReadBack ? QStringLiteral("readBack") : QStringLiteral("memory"));
+                        depthRoute.insert(QStringLiteral("viewsWhy"), m_depthRenderer->lastViewsRouteWhy());
+                    }
                 } else if (drawResult == QQuickVideoDepth::Renderer::Result::Failed) {
                     qCDebug(qLcVideo)
                             << "the views of a picture with its depth map could not be drawn";
@@ -1807,6 +1859,7 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
     }
     setDepthChoice(depthChoice);
     setDepthGpuMemory(depthMemory);
+    setDepthRoute(depthRoute);
     const bool depthDrawn =
             depthInput != StereoNone && depthPictureRect.isNull() && st.view != StereoFlat;
     shown = input;

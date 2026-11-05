@@ -98,6 +98,8 @@ private slots:
     void depthDeepCases_data();
     void depthDeepCases();
     void depthInVideoOutput();
+    void depthViewsReachTheSinkAsTextures_data();
+    void depthViewsReachTheSinkAsTextures();
     void depthRotated_data();
     void depthRotated();
     void depthRotatedFormats_data();
@@ -1445,6 +1447,122 @@ void tst_QQuickVideoStereo::depthInVideoOutput()
     sink->setVideoFrame(unmarked);
     QTRY_COMPARE(output.stereoPacking(), QQuickVideoOutput::StereoDepthTopBottom);
     QTRY_COMPARE(output.implicitHeight(), qreal(h));
+}
+
+namespace {
+
+// A picture and its depth map side by side at 10 or 16 bits (YUV420P10, P010, P016): a gradient with the content's low bits in use
+QVideoFrame deepDepthFrame(QVideoFrameFormat::PixelFormat pf, int w, int h)
+{
+    const bool semi = pf == QVideoFrameFormat::Format_P010 || pf == QVideoFrameFormat::Format_P016;
+    const int shift = pf == QVideoFrameFormat::Format_P010 ? 6 : 0;
+    const int scale = pf == QVideoFrameFormat::Format_P016 ? 64 : 1; // a 10 bit code as a 16 bit word
+    QVideoFrameFormat format(QSize(2 * w, h), pf);
+    format.setColorRange(QVideoFrameFormat::ColorRange_Full);
+    format.setStereoMode(Mode::DepthSideBySide);
+    QVideoFrame frame(format);
+    if (!frame.map(QVideoFrame::WriteOnly))
+        return {};
+    for (int y = 0; y < h; ++y) {
+        auto *row = reinterpret_cast<quint16 *>(frame.bits(0) + y * frame.bytesPerLine(0));
+        for (int x = 0; x < 2 * w; ++x) {
+            const int code = x < w ? 100 + (x * 6 + y * 4) % 800 : 200 + ((x - w) * 7 + y) % 600;
+            row[x] = quint16((code * scale) << shift);
+        }
+    }
+    const quint16 mid = quint16((512 * scale) << shift);
+    for (int y = 0; y < h / 2; ++y) {
+        if (semi) {
+            auto *row = reinterpret_cast<quint16 *>(frame.bits(1) + y * frame.bytesPerLine(1));
+            for (int x = 0; x < 2 * w; ++x)
+                row[x] = mid;
+        } else {
+            for (int plane = 1; plane <= 2; ++plane) {
+                auto *row = reinterpret_cast<quint16 *>(frame.bits(plane) + y * frame.bytesPerLine(plane));
+                for (int x = 0; x < w; ++x)
+                    row[x] = mid;
+            }
+        }
+    }
+    frame.unmap();
+    return frame;
+}
+
+}
+
+void tst_QQuickVideoStereo::depthViewsReachTheSinkAsTextures_data()
+{
+    QTest::addColumn<int>("format");
+    QTest::newRow("8 bit, YUV 4:4:4") << int(QVideoFrameFormat::Format_YUV444P);
+    QTest::newRow("10 bit, YUV 4:2:0") << int(QVideoFrameFormat::Format_YUV420P10);
+    QTest::newRow("10 bit, P010") << int(QVideoFrameFormat::Format_P010);
+    QTest::newRow("16 bit, P016") << int(QVideoFrameFormat::Format_P016);
+}
+
+// The drawn views reach the video sink as textures of the drawing context, shared with the scene graph's: no read back to system memory
+// (viewsReadBacks 0), and what the window shows is what the read back (QT_MM_DEPTH_COPY_VIEWS) shows, pixel for pixel. The read back is
+// the control: it is counted, and its reason is told.
+void tst_QQuickVideoStereo::depthViewsReachTheSinkAsTextures()
+{
+    if (!QQuickVideoDepth::canDraw())
+        QSKIP("built without libstereo-dibr");
+    if (qgetenv("QSG_RHI_BACKEND") != "opengl")
+        QSKIP("QSG_RHI_BACKEND=opengl is not set: the sink must draw with OpenGL");
+    QFETCH(int, format);
+    const auto pf = QVideoFrameFormat::PixelFormat(format);
+    QTemporaryDir cache;
+    qputenv("XDG_CACHE_HOME", cache.path().toLocal8Bit());
+    const int w = 128, h = 64;
+    struct Run
+    {
+        QImage image;
+        QVariantMap route, counts;
+    };
+    auto run = [&](bool readBack) {
+        Run r;
+        qputenv("QT_MM_DEPTH_COPY_VIEWS", readBack ? "1" : "0");
+        QQuickWindow window;
+        window.resize(2 * w, h);
+        QQuickVideoOutput output;
+        output.setParentItem(window.contentItem());
+        output.setSize(QSizeF(2 * w, h));
+        window.show();
+        if (!QTest::qWaitForWindowExposed(&window))
+            return r;
+        const QVideoFrame frame = pf == QVideoFrameFormat::Format_YUV444P ? depthFrame(Mode::DepthSideBySide, false, w, h)
+                                                                          : deepDepthFrame(pf, w, h);
+        for (int i = 0; i < 4; ++i) {
+            output.videoSink()->setVideoFrame(frame);
+            QTest::qWait(100);
+        }
+        r.route = output.stereoDepthRoute();
+        r.counts = output.stereoDepthReadBacks();
+        r.image = window.grabWindow().convertToFormat(QImage::Format_RGBA8888);
+        return r;
+    };
+    const Run texture = run(false);
+    const Run copy = run(true);
+    qunsetenv("QT_MM_DEPTH_COPY_VIEWS");
+    QVERIFY(!texture.image.isNull() && !copy.image.isNull());
+    QCOMPARE(texture.route.value("views").toString(), u"texture"_s);
+    QCOMPARE(texture.counts.value("views").toInt(), 0);
+    QCOMPARE(copy.route.value("views").toString(), u"readBack"_s);
+    QVERIFY(copy.counts.value("views").toInt() >= 1);
+    QVERIFY(copy.route.value("viewsWhy").toString().contains(u"asked"_s));
+    // the window shows something (not one flat colour), and the same with both routes
+    std::set<QRgb> colours;
+    for (int y = 0; y < texture.image.height(); y += 3)
+        for (int x = 0; x < texture.image.width(); x += 3)
+            colours.insert(texture.image.pixel(x, y));
+    QVERIFY2(colours.size() > 16, "the window shows one flat colour");
+    QCOMPARE(texture.image.size(), copy.image.size());
+    int worst = 0;
+    for (int y = 0; y < texture.image.height(); ++y)
+        for (int x = 0; x < texture.image.width(); ++x) {
+            const QRgb a = texture.image.pixel(x, y), b = copy.image.pixel(x, y);
+            worst = std::max({ worst, std::abs(qRed(a) - qRed(b)), std::abs(qGreen(a) - qGreen(b)), std::abs(qBlue(a) - qBlue(b)) });
+        }
+    QVERIFY2(worst == 0, qPrintable(u"the texture route and the read back differ by %1 codes"_s.arg(worst)));
 }
 
 namespace {

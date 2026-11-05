@@ -29,7 +29,10 @@
 #endif
 
 #include <array>
+#include <atomic>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <cmath>
 #include <cstring>
 #include <utility>
@@ -94,6 +97,8 @@ Options::Options()
     automatic = o.automatic != 0;
     // the decoder's frames are imported where they are, unless QT_MM_DEPTH_COPY_FRAMES asks for the copy to system memory
     importFrames = !qEnvironmentVariableIntValue("QT_MM_DEPTH_COPY_FRAMES");
+    // the drawn views go to the sink as textures, unless QT_MM_DEPTH_COPY_VIEWS asks for the read back to system memory
+    viewsAsTexture = !qEnvironmentVariableIntValue("QT_MM_DEPTH_COPY_VIEWS");
 #endif
 }
 
@@ -591,9 +596,26 @@ void main()
 // them place the pictures)
 constexpr uintptr_t kImportedBase = uintptr_t(1) << 40;
 
+// A texture of the drawing context: its name, size and internal format
+struct GlTex
+{
+    unsigned id = 0;
+    int w = 0, h = 0;
+    unsigned internal = 0;
+};
+
 class GpuDrawer
 {
 public:
+    // The planes of the drawn views, textures of the drawing context handed to the video sink: RGBA8 for an 8 bit source, the source's own
+    // planes (R16, RG16) for a deeper one. generation tells the context they belong to (a new context makes the old ones void).
+    struct Views
+    {
+        std::array<GlTex, 3> plane;
+        int nplanes = 0;
+        unsigned generation = 0;
+    };
+
     enum class Source { Planar, SemiUV, SemiVU, Rgba };
 
     // A source deeper than 8 bits: its words, and what they mean (see kConvert)
@@ -642,37 +664,65 @@ public:
 
     // The context and the library's passes, made on the thread that draws (a context belongs to
     // one thread). Returns false with the reason.
-    bool ensure(QString *why)
+    bool ensure(QString *why, QOpenGLContext *share = nullptr)
     {
         if (m_lost) {
             *why = QStringLiteral("the GPU was reset while drawing, it is not used again for this video");
             return false;
         }
-        if (m_gl && m_thread == QThread::currentThread())
+        // the sink's context appeared or changed: the drawing context is made again to share its textures
+        if (m_gl && m_thread == QThread::currentThread() && (!share || share == m_shareUsed))
             return true;
-        if (m_failedThread == QThread::currentThread()) {
+        if (!m_gl && m_failedThread == QThread::currentThread() && share == m_failedShare) {
             *why = m_whyNot;
             return false;
         }
         destroy();
         m_thread = QThread::currentThread();
-        auto context = std::make_unique<QOpenGLContext>();
-        QSurfaceFormat format;
-        format.setVersion(3, 3);
-        format.setProfile(QSurfaceFormat::CoreProfile);
-        // a context that tells when the GPU was reset (KHR_robustness): the library watches it (stereo_dibr_gl_reset_status())
-        format.setOption(QSurfaceFormat::ResetNotification);
-        context->setFormat(format);
-        if (!context->create()) {
-            // OpenGL ES 3.0, for a platform that has no desktop OpenGL
-            format = QSurfaceFormat();
-            format.setRenderableType(QSurfaceFormat::OpenGLES);
-            format.setVersion(3, 0);
-            format.setOption(QSurfaceFormat::ResetNotification);
-            context->setFormat(format);
-            if (!context->create())
-                return fail(QStringLiteral("no OpenGL 3.3 or OpenGL ES 3.0 context could be made"), why);
+        m_failedShare = share;
+        m_shareWhy.clear();
+        // The context shares the sink's when there is one: a texture of the drawing context is then a texture the sink can draw. It is made
+        // of the sink's kind (desktop OpenGL or OpenGL ES); where sharing is refused, the context is made without, and the views are read back.
+        std::unique_ptr<QOpenGLContext> context;
+        for (int attempt = 0; attempt < (share ? 2 : 1) && !context; ++attempt) {
+            QOpenGLContext *with = attempt == 0 ? share : nullptr;
+            auto candidate = std::make_unique<QOpenGLContext>();
+            if (with)
+                candidate->setShareContext(with);
+            bool created = false;
+            if (!with || !with->isOpenGLES()) {
+                QSurfaceFormat format;
+                format.setVersion(3, 3);
+                format.setProfile(QSurfaceFormat::CoreProfile);
+                // a context that tells when the GPU was reset (KHR_robustness): the library watches it (stereo_dibr_gl_reset_status())
+                format.setOption(QSurfaceFormat::ResetNotification);
+                candidate->setFormat(format);
+                created = candidate->create();
+            }
+            if (!created) {
+                // OpenGL ES 3.0, for a platform that has no desktop OpenGL
+                if (!with || with->isOpenGLES()) {
+                    QSurfaceFormat format;
+                    format.setRenderableType(QSurfaceFormat::OpenGLES);
+                    format.setVersion(3, 0);
+                    format.setOption(QSurfaceFormat::ResetNotification);
+                    candidate->setFormat(format);
+                    created = candidate->create();
+                }
+            }
+            if (created) {
+                m_shared = with && candidate->shareContext() == with;
+                m_group = m_shared ? candidate->shareGroup() : nullptr;
+                context = std::move(candidate);
+            } else if (with) {
+                m_shareWhy = QStringLiteral("an OpenGL context sharing the video sink's could not be made");
+            }
         }
+        if (!context) {
+            m_shareUsed = share;
+            return fail(QStringLiteral("no OpenGL 3.3 or OpenGL ES 3.0 context could be made"), why);
+        }
+        m_shareUsed = share;
         auto surface = std::make_unique<QOffscreenSurface>();
         surface->setFormat(context->format());
         surface->create();
@@ -697,6 +747,71 @@ public:
         m_f->glGenFramebuffers(1, &m_fbo);
         m_context->doneCurrent();
         return true;
+    }
+
+    // Whether textures of this context are textures of the sink's (the context shares it), and when not, why
+    bool sharesSink(QString *why) const
+    {
+        if (m_shared)
+            return true;
+        *why = m_shareWhy.isEmpty() ? QStringLiteral("the drawing context shares no context with the video sink") : m_shareWhy;
+        return false;
+    }
+    // Whether a QRhi draws with OpenGL in the group of this context: the sink can take its textures
+    bool takenBy(QRhi &rhi) const
+    {
+        QOpenGLContextGroup *group = m_group.load();
+        if (!group || rhi.backend() != QRhi::OpenGLES2)
+            return false;
+        const auto *handles = static_cast<const QRhiGles2NativeHandles *>(rhi.nativeHandles());
+        return handles && handles->context && handles->context->shareGroup() == group;
+    }
+
+    // A frame of textures is let go (from any thread): its textures wait for the next drawing, or are deleted on this context's thread
+    void recycle(const Views &v)
+    {
+        std::lock_guard<std::mutex> lock(m_poolMutex);
+        if (v.generation != m_generation)
+            return;
+        for (int i = 0; i < v.nplanes; ++i) {
+            m_out.erase(v.plane[i].id);
+            (m_pool.size() < 8 ? m_pool : m_trash).push_back(v.plane[i]);
+        }
+    }
+    unsigned generation()
+    {
+        std::lock_guard<std::mutex> lock(m_poolMutex);
+        return m_generation;
+    }
+
+    // The planes of a frame of textures read back to system memory (what a consumer that is not the sink asks for), each into dst[i] with
+    // its row stride in bytes. Returns false when the context is gone.
+    bool readBack(const Views &v, uchar *const *dst, const int *strideBytes)
+    {
+        bool ok = false;
+        run([&] {
+            if (v.generation != generation() || !m_context || !makeCurrent())
+                return;
+            ok = true;
+            for (int i = 0; i < v.nplanes && ok; ++i) {
+                const GlTex &t = v.plane[i];
+                m_f->glBindFramebuffer(GL_FRAMEBUFFER_, m_fbo);
+                m_f->glFramebufferTexture2D(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D_, t.id, 0);
+                ok = m_f->glCheckFramebufferStatus(GL_FRAMEBUFFER_) == GL_FRAMEBUFFER_COMPLETE_;
+                if (!ok)
+                    break;
+                const bool bytes = t.internal == GL_RGBA8_;
+                const unsigned format = bytes ? GL_RGBA_ : t.internal == GL_RG16_ ? GL_RG_ : GL_RED_;
+                const int pixel = bytes || t.internal == GL_RG16_ ? 4 : 2;
+                m_f->glPixelStorei(0x0D05 /* GL_PACK_ALIGNMENT */, 1);
+                m_f->glPixelStorei(GL_PACK_ROW_LENGTH_, strideBytes[i] / pixel);
+                m_f->glReadPixels(0, 0, t.w, t.h, format, bytes ? GL_UNSIGNED_BYTE_ : GL_UNSIGNED_SHORT_, dst[i]);
+                m_f->glPixelStorei(GL_PACK_ROW_LENGTH_, 0);
+                ok = m_f->glGetError() == 0;
+            }
+            doneCurrent();
+        });
+        return ok;
     }
 
     // The QRhi of the drawing context: the decoder's texture converters map their frames through one
@@ -825,11 +940,13 @@ public:
     // width), in the current context. parts are the picture and its depth map (stereo_dibr_unpack()
     // of the frame, turned as the frame asks), dparts the same for the depth component of the
     // frame. Returns false with the reason.
+    // With views, the drawn views stay on the GPU as textures for the video sink (no read back); without, they are read back into result.
     bool draw(Source source, const Deep &deep, bool fullRange, int colorSpace,
               const stereo_dibr_parts &parts, const stereo_dibr_parts &dparts,
               const stereo_dibr_params &prm, const float *table, int tableSize,
-              const float *layerTable, QVideoFrame *result, QString *why)
+              const float *layerTable, QVideoFrame *result, Views *views, QString *why)
     {
+        dropTrash();
         const int vw = parts.picture.width, vh = parts.picture.height;
         if (deep.on && !m_deepOk) {
             *why = QStringLiteral("this OpenGL ES has no GL_EXT_texture_norm16: the 16 bit planes have no texture format");
@@ -877,7 +994,16 @@ public:
             return false;
         }
         if (deep.on)
-            return encodeViews(fullRange, colorSpace, vw, vh, result, why);
+            return encodeViews(fullRange, colorSpace, vw, vh, result, views, why);
+        if (views) {
+            // the target is the frame: handed out as it is, finished before the sink's context draws it
+            m_f->glFinish();
+            *views = {};
+            views->nplanes = 1;
+            views->plane[0] = handOut(Target);
+            views->generation = m_generation;
+            return m_f->glGetError() == 0 || (*why = QStringLiteral("the views could not be handed to the sink"), false);
+        }
         // the views into the frame
         m_f->glBindFramebuffer(GL_FRAMEBUFFER_, m_fbo);
         m_f->glFramebufferTexture2D(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D_,
@@ -895,12 +1021,7 @@ public:
 
 private:
     enum TexId { Y, U, V, Raw, Pic, Depth, Target, LayerPic, LayerDepth, OutY, OutU, OutV, NbTextures };
-    struct Tex
-    {
-        unsigned id = 0;
-        int w = 0, h = 0;
-        unsigned internal = 0;
-    };
+    using Tex = GlTex;
 
     bool fail(const QString &why, QString *out)
     {
@@ -913,6 +1034,10 @@ private:
 
     void destroy()
     {
+        {
+            std::lock_guard<std::mutex> lock(m_poolMutex);
+            ++m_generation;
+        }
         if (m_context && m_surface && m_context->makeCurrent(m_surface.get())) {
             g_depthContext = m_context.get();
             if (m_gl)
@@ -920,6 +1045,19 @@ private:
             for (Tex &t : m_tex)
                 if (t.id)
                     m_f->glDeleteTextures(1, &t.id);
+            {
+                // the textures given back, and those still with a frame (GL deletes a texture the sink still uses when it lets go of it)
+                std::lock_guard<std::mutex> lock(m_poolMutex);
+                for (const GlTex &t : m_pool)
+                    m_f->glDeleteTextures(1, &t.id);
+                for (const GlTex &t : m_trash)
+                    m_f->glDeleteTextures(1, &t.id);
+                for (unsigned id : m_out)
+                    m_f->glDeleteTextures(1, &id);
+                m_pool.clear();
+                m_trash.clear();
+                m_out.clear();
+            }
             if (m_vao)
                 m_f->glDeleteVertexArrays(1, &m_vao);
             if (m_fbo)
@@ -943,6 +1081,8 @@ private:
         m_tex = {};
         m_vao = m_fbo = m_convert = m_channel = m_encode = m_luma = m_lumaInt = 0;
         m_rhiFailed = false;
+        m_shared = false;
+        m_group = nullptr;
         m_surface.reset();
         m_context.reset();
         m_f = nullptr;
@@ -1006,6 +1146,17 @@ private:
                      unsigned type = GL_UNSIGNED_BYTE_)
     {
         Tex &t = m_tex[id];
+        if (!t.id && (id == Target || id >= OutY)) {
+            // a texture a frame handed out and gave back: the same size and format, drawn into again
+            std::lock_guard<std::mutex> lock(m_poolMutex);
+            for (auto it = m_pool.begin(); it != m_pool.end(); ++it) {
+                if (it->w == w && it->h == h && it->internal == internal) {
+                    t = *it;
+                    m_pool.erase(it);
+                    break;
+                }
+            }
+        }
         if (!t.id)
             m_f->glGenTextures(1, &t.id);
         m_f->glBindTexture(GL_TEXTURE_2D_, t.id);
@@ -1098,7 +1249,7 @@ private:
     }
 
     // The planes of the views at the source's depth, into the frame (result, the source's pixel format)
-    bool encodeViews(bool fullRange, int colorSpace, int vw, int vh, QVideoFrame *result, QString *why)
+    bool encodeViews(bool fullRange, int colorSpace, int vw, int vh, QVideoFrame *result, Views *views, QString *why)
     {
         float kr, kb;
         kForMatrix(colorSpace, &kr, &kb);
@@ -1120,7 +1271,9 @@ private:
             pass(m_encode, out, w, h);
         };
         run(0, OutY, tw, vh, 1);
-        if (!readPlane(OutY, tw, vh, 1, result->bits(0), result->bytesPerLine(0))) {
+        if (views)
+            *views = {};
+        if (!views && !readPlane(OutY, tw, vh, 1, result->bits(0), result->bytesPerLine(0))) {
             *why = QStringLiteral("the luma of the views could not be read back");
             return false;
         }
@@ -1128,20 +1281,58 @@ private:
         const int ch = (vh + (1 << m_deep.log2h) - 1) >> m_deep.log2h;
         if (m_deep.semi) {
             run(3, OutU, cw, ch, 2);
-            if (!readPlane(OutU, cw, ch, 2, result->bits(1), result->bytesPerLine(1))) {
+            if (!views && !readPlane(OutU, cw, ch, 2, result->bits(1), result->bytesPerLine(1))) {
                 *why = QStringLiteral("the chroma of the views could not be read back");
                 return false;
             }
         } else {
             run(1, OutU, cw, ch, 1);
             run(2, OutV, cw, ch, 1);
-            if (!readPlane(OutU, cw, ch, 1, result->bits(1), result->bytesPerLine(1))
-                || !readPlane(OutV, cw, ch, 1, result->bits(2), result->bytesPerLine(2))) {
+            if (!views
+                && (!readPlane(OutU, cw, ch, 1, result->bits(1), result->bytesPerLine(1))
+                    || !readPlane(OutV, cw, ch, 1, result->bits(2), result->bytesPerLine(2)))) {
                 *why = QStringLiteral("the chroma of the views could not be read back");
                 return false;
             }
         }
+        if (views) {
+            // the planes are the frame: handed out as they are, finished before the sink's context draws them
+            m_f->glFinish();
+            views->plane[0] = handOut(OutY);
+            views->plane[1] = handOut(OutU);
+            views->nplanes = 2;
+            if (!m_deep.semi) {
+                views->plane[2] = handOut(OutV);
+                views->nplanes = 3;
+            }
+            views->generation = m_generation;
+            if (m_f->glGetError() != 0) {
+                *why = QStringLiteral("the views could not be handed to the sink");
+                return false;
+            }
+        }
         return true;
+    }
+
+    // The texture of a slot leaves the drawer with a frame: the slot is made again (or taken from the textures given back) for the next
+    GlTex handOut(TexId id)
+    {
+        GlTex t = m_tex[id];
+        m_tex[id] = {};
+        std::lock_guard<std::mutex> lock(m_poolMutex);
+        m_out.insert(t.id);
+        return t;
+    }
+
+    void dropTrash()
+    {
+        std::vector<GlTex> trash;
+        {
+            std::lock_guard<std::mutex> lock(m_poolMutex);
+            trash.swap(m_trash);
+        }
+        for (const GlTex &t : trash)
+            m_f->glDeleteTextures(1, &t.id);
     }
 
     void pass(unsigned prog, TexId out, int w, int h)
@@ -1304,6 +1495,15 @@ private:
     std::array<Tex, NbTextures> m_tex;
     unsigned m_vao = 0, m_fbo = 0, m_convert = 0, m_channel = 0, m_encode = 0;
     bool m_lost = false;
+    // the context the drawing context shares (the sink's), whether it does, and what the pool of textures handed out holds
+    QOpenGLContext *m_shareUsed = nullptr, *m_failedShare = nullptr;
+    bool m_shared = false;
+    std::atomic<QOpenGLContextGroup *> m_group { nullptr };
+    QString m_shareWhy;
+    std::mutex m_poolMutex;
+    std::vector<GlTex> m_pool, m_trash;
+    std::set<unsigned> m_out;
+    unsigned m_generation = 1;
     bool m_deepOk = true;
     Deep m_deep;
     std::unique_ptr<QRhi> m_rhi;
@@ -1314,6 +1514,67 @@ private:
     unsigned m_luma = 0, m_lumaInt = 0;
     uintptr_t m_importBase = 0;
     ptrdiff_t m_importStride = 0, m_importBytes = 1;
+};
+
+// The drawn views as a frame of textures of the drawing context (handed to the sink as they are) and, for a consumer that maps the frame, a
+// read back of those textures (counted)
+class DrawnViewsBuffer final : public QHwVideoBuffer
+{
+public:
+    DrawnViewsBuffer(std::shared_ptr<GpuDrawer> drawer, const GpuDrawer::Views &views, const QVideoFrameFormat &format,
+                     std::shared_ptr<std::atomic<int>> readBacks)
+        : QHwVideoBuffer(QVideoFrame::RhiTextureHandle), m_drawer(std::move(drawer)), m_views(views), m_format(format),
+          m_readBacks(std::move(readBacks))
+    {
+    }
+    ~DrawnViewsBuffer() override { m_drawer->recycle(m_views); }
+
+    MapData map(QVideoFrame::MapMode mode) override
+    {
+        if (mode != QVideoFrame::ReadOnly)
+            return {};
+        if (!m_mapped) {
+            uchar *dst[3] = {};
+            int stride[3] = {};
+            for (int i = 0; i < m_views.nplanes; ++i) {
+                const GlTex &t = m_views.plane[i];
+                const int pixel = t.internal == GL_RGBA8_ || t.internal == GL_RG16_ ? 4 : 2;
+                stride[i] = t.w * pixel;
+                m_bytes[i].resize(qsizetype(stride[i]) * t.h);
+                dst[i] = reinterpret_cast<uchar *>(m_bytes[i].data());
+                m_stride[i] = stride[i];
+            }
+            if (!m_drawer->readBack(m_views, dst, stride))
+                return {};
+            ++*m_readBacks;
+            m_mapped = true;
+        }
+        MapData data;
+        data.planeCount = m_views.nplanes;
+        for (int i = 0; i < m_views.nplanes; ++i) {
+            data.bytesPerLine[i] = m_stride[i];
+            data.data[i] = reinterpret_cast<uchar *>(m_bytes[i].data());
+            data.dataSize[i] = int(m_bytes[i].size());
+        }
+        return data;
+    }
+    void unmap() override { }
+    QVideoFrameFormat format() const override { return m_format; }
+    quint64 textureHandle(QRhi &rhi, int plane) override
+    {
+        if (plane < 0 || plane >= m_views.nplanes || m_views.generation != m_drawer->generation() || !m_drawer->takenBy(rhi))
+            return 0;
+        return m_views.plane[plane].id;
+    }
+
+private:
+    std::shared_ptr<GpuDrawer> m_drawer;
+    GpuDrawer::Views m_views;
+    QVideoFrameFormat m_format;
+    std::shared_ptr<std::atomic<int>> m_readBacks;
+    std::array<QByteArray, 3> m_bytes;
+    int m_stride[3] = {};
+    bool m_mapped = false;
 };
 
 #endif // QT_MM_DEPTH_GPU
@@ -1328,8 +1589,16 @@ struct Renderer::Private
     std::vector<float> table, layerTable;
     std::vector<uint16_t> lut;
 #ifdef QT_MM_DEPTH_GPU
-    GpuDrawer gpu;
+    // shared with the frames of textures handed to the sink: the context lives as long as one of them
+    std::shared_ptr<GpuDrawer> gpuOwner = std::make_shared<GpuDrawer>();
+    GpuDrawer &gpu = *gpuOwner;
 #endif
+    // the video sink (its RHI), and how the last drawn views reached it
+    QRhi *sink = nullptr;
+    ViewsRoute viewsRoute = ViewsRoute::Memory;
+    QString viewsWhy;
+    std::shared_ptr<std::atomic<int>> viewReadBacks = std::make_shared<std::atomic<int>>(0);
+    QString saidViews;
     // what the automatic way chose for the last frame, and where it was drawn
     Choice choice;
     bool onGpu = false;
@@ -1352,6 +1621,23 @@ struct Renderer::Private
     } timing;
     // what the log was told last, so that it says it when it changes and not for every frame
     QString said;
+    QString saidRoute;
+
+    void sayRoute(const QString &where)
+    {
+        if (saidRoute == where)
+            return;
+        saidRoute = where;
+        qCInfo(qLcVideoDepth).noquote() << where;
+    }
+
+    void sayViews(const QString &where)
+    {
+        if (saidViews == where)
+            return;
+        saidViews = where;
+        qCInfo(qLcVideoDepth).noquote() << where;
+    }
 
     ~Private() { stereo_dibr_free(dibr); }
 
@@ -1616,13 +1902,12 @@ Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, M
                 imported = true;
                 importLive = true;
                 route = FrameRoute::Imported;
-                say(QStringLiteral("hardware frames of the decoder are read by the drawing passes where they are, no read back to "
-                                   "system memory (mapped through the decoder's texture converter)"),
-                    false);
+                sayRoute(QStringLiteral("hardware frames of the decoder are read by the drawing passes where they are, no read back to "
+                                        "system memory (mapped through the decoder's texture converter)"));
             } else if (hardware) {
                 route = FrameRoute::Copied;
                 routeWhy = reason;
-                say(QStringLiteral("hardware frames of the decoder are copied to system memory: %1").arg(reason), false);
+                sayRoute(QStringLiteral("hardware frames of the decoder are copied to system memory: %1").arg(reason));
             }
         }
     }
@@ -1765,10 +2050,35 @@ Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, M
         const QSize par = format.pixelAspectRatio();
         format.setPixelAspectRatio(QSize(par.height(), par.width()));
     }
-    QVideoFrame result(format);
-    if (!result.map(QVideoFrame::WriteOnly)) {
-        unmapFrame();
-        return Outcome::Failed;
+    // The drawn views reach the sink as textures of the drawing context, which shares the sink's (OpenGL), unless the person asked for the
+    // read back or the sink cannot take a texture: then they are read back to system memory, counted and said
+    viewsRoute = ViewsRoute::Memory;
+    viewsWhy.clear();
+    bool texOut = false;
+#ifdef QT_MM_DEPTH_GPU
+    if (useGpu) {
+        if (!options.viewsAsTexture)
+            viewsWhy = QStringLiteral("the read back was asked for");
+        else if (!sink)
+            viewsWhy = QStringLiteral("the video has no sink to show the views yet");
+        else if (sink->backend() != QRhi::OpenGLES2)
+            viewsWhy = QStringLiteral("the video sink draws with %1, which takes a frame from system memory here")
+                               .arg(QString::fromLatin1(sink->backendName()));
+        else if (!gpu.sharesSink(&viewsWhy))
+            ;
+        else if (!gpu.takenBy(*sink))
+            viewsWhy = QStringLiteral("the video sink draws in another OpenGL context group than the drawing context");
+        else
+            texOut = true;
+    }
+#endif
+    QVideoFrame result;
+    if (!texOut) {
+        result = QVideoFrame(format);
+        if (!result.map(QVideoFrame::WriteOnly)) {
+            unmapFrame();
+            return Outcome::Failed;
+        }
     }
 
     bool knownRate = false;
@@ -1787,6 +2097,7 @@ Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, M
     if (useGpu) {
         bool ok = false;
         QString reason;
+        GpuDrawer::Views views;
         gpu.run([&] {
             ok = gpu.makeCurrent();
             if (!ok)
@@ -1808,7 +2119,8 @@ Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, M
                                               ? 2
                                               : 0,
                               parts, depthParts, prm, table.data(), int(tableSize),
-                              layerTable.empty() ? nullptr : layerTable.data(), &result, &reason);
+                              layerTable.empty() ? nullptr : layerTable.data(), texOut ? nullptr : &result,
+                              texOut ? &views : nullptr, &reason);
             gpu.releaseImport();
             if (ok && (!gpuMem.valid || gpuMem.width != vw || gpuMem.height != vh || memoryFrames++ % 600 == 0)) {
                 // the driver's free memory, once a size and every few seconds
@@ -1830,9 +2142,20 @@ Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, M
         onGpu = true;
         if (choice.valid && !knownRate)
             choice.fps = fps;
-        result.setStartTime(input.startTime());
-        result.setEndTime(input.endTime());
-        *out = result;
+        if (texOut) {
+            *out = QVideoFramePrivate::createFrame(
+                    std::make_unique<DrawnViewsBuffer>(gpuOwner, views, format, viewReadBacks), format);
+            viewsRoute = ViewsRoute::Texture;
+            sayViews(QStringLiteral("the drawn views go to the video sink as textures of the GPU, shared with the sink's context: "
+                                    "no read back to system memory"));
+        } else {
+            ++*viewReadBacks;
+            viewsRoute = ViewsRoute::ReadBack;
+            sayViews(QStringLiteral("the drawn views are read back to system memory: %1").arg(viewsWhy));
+            *out = result;
+        }
+        out->setStartTime(input.startTime());
+        out->setEndTime(input.endTime());
         return Outcome::Drawn;
     }
 #endif
@@ -1880,6 +2203,8 @@ Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, M
     if (r < 0)
         return Outcome::Failed;
     onGpu = false;
+    viewsRoute = ViewsRoute::Memory;
+    viewsWhy = QStringLiteral("the views are drawn on the processor, in system memory");
     result.setStartTime(input.startTime());
     result.setEndTime(input.endTime());
     *out = result;
@@ -1923,6 +2248,26 @@ int Renderer::hardwareReadBacks() const
     return d->hwReadBacks;
 }
 
+void Renderer::setSinkRhi(QRhi *rhi)
+{
+    d->sink = rhi;
+}
+
+Renderer::ViewsRoute Renderer::lastViewsRoute() const
+{
+    return d->viewsRoute;
+}
+
+QString Renderer::lastViewsRouteWhy() const
+{
+    return d->viewsWhy;
+}
+
+int Renderer::viewsReadBacks() const
+{
+    return *d->viewReadBacks;
+}
+
 Renderer::Result Renderer::draw(const QVideoFrame &input, Mode mode, bool depthFirst,
                                 const QString &fileMark, const Options &options, QVideoFrame *out)
 {
@@ -1940,7 +2285,13 @@ Renderer::Result Renderer::draw(const QVideoFrame &input, Mode mode, bool depthF
     } else {
         QString why;
         bool made = false;
-        d->gpu.run([&] { made = d->gpu.ensure(&why); });
+        // the drawing context shares the video sink's when the sink draws with OpenGL
+        QOpenGLContext *share = nullptr;
+        if (d->sink && d->sink->backend() == QRhi::OpenGLES2) {
+            const auto *handles = static_cast<const QRhiGles2NativeHandles *>(d->sink->nativeHandles());
+            share = handles ? handles->context : nullptr;
+        }
+        d->gpu.run([&] { made = d->gpu.ensure(&why, share); });
         if (made)
             tryGpu = true;
         else
@@ -2019,6 +2370,25 @@ QString Renderer::lastFrameRouteWhy() const
 }
 
 int Renderer::hardwareReadBacks() const
+{
+    return 0;
+}
+
+void Renderer::setSinkRhi(QRhi *)
+{
+}
+
+Renderer::ViewsRoute Renderer::lastViewsRoute() const
+{
+    return ViewsRoute::Memory;
+}
+
+QString Renderer::lastViewsRouteWhy() const
+{
+    return {};
+}
+
+int Renderer::viewsReadBacks() const
 {
     return 0;
 }

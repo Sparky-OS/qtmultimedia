@@ -29,6 +29,8 @@ QT_BEGIN_NAMESPACE
 // with libstereo-dibr (depth-image-based rendering, Sparky Stereo OS's stereo-layer) into a full
 // side by side frame, both views at the picture's size, the left eye first. The layouts and the
 // meaning of the samples are the depth marks (stereo-layer, docs/depth-marks.md).
+class QRhi;
+
 namespace QQuickVideoDepth {
 
 // Every choice of how the views are drawn. The defaults are libstereo-dibr's, the one default of
@@ -57,6 +59,9 @@ struct Q_MULTIMEDIAQUICK_EXPORT Options
     // A frame the decoder keeps on a GPU is read by the passes where it is, no copy to system memory, when the decoder's texture
     // converter can map it into the drawing context; false: it is copied (the log says which). Same views either way.
     bool importFrames = true;
+    // The drawn views go to the video sink as textures of the drawing context, shared with the sink's (no read back to system memory), when
+    // the sink draws with OpenGL; false: they are read back (the log says which, and why). Same views either way.
+    bool viewsAsTexture = true;
     // -1: what the video says; else a kind of libstereo-dibr (0 nearness .. 9 metric)
     int meaning = -1;
     double zNear = 0, zFar = 0; // the near and far distances, when both are set
@@ -141,6 +146,18 @@ public:
     QString lastFrameRouteWhy() const;
     // The hardware frames this Renderer read back to system memory
     int hardwareReadBacks() const;
+
+    // The video sink the drawn views are shown by: when it draws with OpenGL the drawing context is made to share its textures (the
+    // sink's RHI is the scene graph's, set from the thread that shows the frames)
+    void setSinkRhi(QRhi *rhi);
+    // How the last drawn views reached the sink: Memory (drawn by the C code in a frame of system memory), Texture (the drawing
+    // context's textures, no read back) or ReadBack (read back to system memory, why in lastViewsRouteWhy())
+    enum class ViewsRoute { Memory, Texture, ReadBack };
+    ViewsRoute lastViewsRoute() const;
+    QString lastViewsRouteWhy() const;
+    // The drawn views read back to system memory: by the drawing, and by whoever mapped a frame of textures (a consumer that is not
+    // the sink)
+    int viewsReadBacks() const;
 
 private:
     struct Private;

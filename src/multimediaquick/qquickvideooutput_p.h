@@ -119,6 +119,7 @@ class Q_MULTIMEDIAQUICK_EXPORT QQuickVideoOutput : public QQuickItem
                        NOTIFY stereoDepthGpuChanged)
     Q_PROPERTY(QVariantMap stereoDepthChoice READ stereoDepthChoice NOTIFY stereoDepthChoiceChanged)
     Q_PROPERTY(QVariantMap stereoDepthGpuMemory READ stereoDepthGpuMemory NOTIFY stereoDepthGpuMemoryChanged)
+    Q_PROPERTY(QVariantMap stereoDepthRoute READ stereoDepthRoute NOTIFY stereoDepthRouteChanged)
     Q_MOC_INCLUDE(qvideosink.h)
     Q_MOC_INCLUDE(qvideoframe.h)
     QML_NAMED_ELEMENT(VideoOutput)
@@ -322,6 +323,9 @@ public:
     void setStereoDepthGpu(bool value);
     QVariantMap stereoDepthChoice() const;
     QVariantMap stereoDepthGpuMemory() const;
+    QVariantMap stereoDepthRoute() const;
+    // The frames read back to system memory so far: the decoder's (\c frames) and the drawn views' (\c views)
+    Q_INVOKABLE QVariantMap stereoDepthReadBacks() const;
     void setStereoDepthMark(const QString &value);
 
 Q_SIGNALS:
@@ -359,6 +363,7 @@ Q_SIGNALS:
     void stereoDepthGpuChanged();
     void stereoDepthChoiceChanged();
     void stereoDepthGpuMemoryChanged();
+    void stereoDepthRouteChanged();
 
 protected:
     QSGNode *updatePaintNode(QSGNode *, UpdatePaintNodeData *) override;
@@ -436,13 +441,15 @@ private:
     QVideoFrame m_stereoLastFrame;          // to show again when the choices change
     // draws the views of a picture with its depth map (libstereo-dibr), from the threads of the
     // video and of the item in turn
-    QMutex m_depthMutex;
+    mutable QMutex m_depthMutex;
     std::unique_ptr<QQuickVideoDepth::Renderer> m_depthRenderer;
     // what the automatic way chose for the video that plays (guarded by m_frameMutex)
     QVariantMap m_depthChoice;
     void setDepthChoice(const QQuickVideoDepth::Choice &choice);
     QVariantMap m_depthGpuMemory;
     void setDepthGpuMemory(const QQuickVideoDepth::GpuMemory &memory);
+    QVariantMap m_depthRoute;
+    void setDepthRoute(const QVariantMap &route);
     // The layer of the views, where the platform has one (QT_MM_STEREO_LAYER): kept in the class
     // whatever the build, so that every user of this header sees the same class
     struct StereoPair;
