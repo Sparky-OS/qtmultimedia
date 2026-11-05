@@ -70,7 +70,7 @@ q23::expected<CodecContext, QString> CodecContext::create(AVStream *stream,
     std::unique_ptr<QFFmpeg::HWAccel> hwAccel;
 
     if (videoCodecPolicy == Hw)
-        std::tie(decoder, hwAccel) = HWAccel::findDecoderWithHwAccel(stream->codecpar->codec_id);
+        std::tie(decoder, hwAccel) = HWAccel::findDecoderWithHwAccel(stream->codecpar);
     else
         decoder = QFFmpeg::findAVDecoder(stream->codecpar->codec_id);
 

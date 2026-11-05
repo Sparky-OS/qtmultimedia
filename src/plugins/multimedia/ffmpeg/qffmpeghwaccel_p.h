@@ -73,9 +73,9 @@ class HWAccel
 public:
     ~HWAccel();
 
-    static HWAccelUPtr create(AVHWDeviceType deviceType);
+    static HWAccelUPtr create(AVHWDeviceType deviceType, const char *device = nullptr);
 
-    static std::pair<std::optional<Codec>, HWAccelUPtr> findDecoderWithHwAccel(AVCodecID id);
+    static std::pair<std::optional<Codec>, HWAccelUPtr> findDecoderWithHwAccel(const AVCodecParameters *parameters);
 
     AVHWDeviceType deviceType() const;
 

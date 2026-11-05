@@ -340,3 +340,14 @@ if (ANDROID)
         NAME android.permission.MODIFY_AUDIO_SETTINGS
     )
 endif()
+
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(MEDIA_GPU_ROUTE QUIET IMPORTED_TARGET media-gpu-route)
+    if(MEDIA_GPU_ROUTE_FOUND)
+        qt_internal_extend_target(FFmpegMediaPluginImplPrivate
+            DEFINES HAVE_MEDIA_GPU_ROUTE
+            LIBRARIES PkgConfig::MEDIA_GPU_ROUTE
+        )
+    endif()
+endif()
