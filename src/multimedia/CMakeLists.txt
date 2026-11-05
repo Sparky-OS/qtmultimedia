@@ -156,6 +156,11 @@ qt_internal_extend_target(Multimedia CONDITION QT_FEATURE_network
         Qt::Network
 )
 
+qt_internal_extend_target(Multimedia CONDITION QT_FEATURE_vulkan
+    SOURCES
+        video/qmultimedia_vulkan_support.cpp video/qmultimedia_vulkan_support_p.h
+)
+
 qt_internal_extend_target(Multimedia
     CONDITION (LINUX OR ANDROID) AND QT_FEATURE_library
     SOURCES qsymbolsresolveutils.cpp qsymbolsresolveutils_p.h)
