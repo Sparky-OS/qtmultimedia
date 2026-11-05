@@ -626,8 +626,11 @@ void QQuickVideoOutput::setStereoShapeFallback(bool fallback)
 /*!
     \qmlproperty enumeration QtMultimedia::VideoOutput::stereoScaling
 
-    The filter that restores the full size of the views of a 3D video: a half view is
-    stretched back to the size of the frame, an interleaved view has half its rows or columns.
+    The filter that restores the full size of one view of a 3D video shown flat in the
+    scene graph (\l stereoView StereoLeftEye or StereoRightEye of an interleaved packing,
+    whose view has half its rows or columns). Where the views are shown in the stereo layer,
+    they go to the compositor at the resolution the video carries them, a half view as it is,
+    and the compositor resizes them once.
 
     \value StereoBilinear Bilinear.
     \value StereoBicubic Bicubic (Catmull-Rom).

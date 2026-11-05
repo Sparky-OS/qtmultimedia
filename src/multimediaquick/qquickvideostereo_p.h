@@ -59,6 +59,14 @@ Q_MULTIMEDIAQUICK_EXPORT bool viewRect(const Packing &packing, QSize frameSize, 
 // of viewSize(). The image is any RGBA float image or an 8 bit one; the result is RGBA32FPx4
 Q_MULTIMEDIAQUICK_EXPORT QImage extractView(const QImage &frame, const Packing &packing, int index, Scaling scaling);
 
+// Copies the view that is first (0) or second (1) in the packing out of the image at the
+// resolution the frame carries it, never scaled: the half of a side by side or top and bottom
+// frame, half or full, the even or odd rows or columns of an interleaved one, the row's own
+// checkers of a checkerboard, the whole frame of a frame sequence. This is what a stereo
+// surface hands the compositor, which resizes it once to the view's place. The image is any
+// RGBA float image or an 8 bit one; the result is RGBA32FPx4
+Q_MULTIMEDIAQUICK_EXPORT QImage storedView(const QImage &frame, const Packing &packing, int index);
+
 // Writes the pair left|right into memory as the given Wayland shm format, the layer's buffer:
 // 8 bits (XRGB8888), 10 bits (XRGB2101010), 16 bits (XBGR16161616) or half float (XBGR16161616F)
 enum class BufferFormat { Xrgb8888, Xrgb2101010, Xbgr16161616, Xbgr16161616f };
