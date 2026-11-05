@@ -230,10 +230,11 @@ std::pair<std::optional<Codec>, HWAccelUPtr> HWAccel::findDecoderWithHwAccel(con
 #ifdef HAVE_MEDIA_GPU_ROUTE
     if (!qEnvironmentVariableIsSet("QT_FFMPEG_DECODING_HW_DEVICE_TYPES")) {
         media_gpu_decoder selection{};
-        const int selected = media_gpu_route_av(id, parameters->profile,
-                                                AVPixelFormat(parameters->format),
-                                                parameters->width, parameters->height,
-                                                &selection);
+        // The texture converters hand decoded surfaces to the RHI without a copy
+        const int selected = media_gpu_route_av_frames(id, parameters->profile,
+                                                       AVPixelFormat(parameters->format),
+                                                       parameters->width, parameters->height,
+                                                       MEDIA_GPU_FRAMES_IMPORT, &selection);
         if (selected == 0)
             return { std::nullopt, nullptr };
         if (selected > 0) {
