@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: LicenseRef-Qt-Commercial OR GPL-3.0-only
 
 #include <QtTest/qtest.h>
+#include <cmath>
 #include <QtCore/qfile.h>
+#include <QtCore/qstring.h>
 #include <QtCore/qjsondocument.h>
 #include <QtCore/qjsonobject.h>
 #include <QtCore/qjsonarray.h>
@@ -11,6 +13,8 @@
 #include <QtQuick/qquickwindow.h>
 #include <QtMultimedia/qvideosink.h>
 #include <QtMultimediaQuick/private/qquickvideooutput_p.h>
+
+using namespace Qt::StringLiterals;
 
 class tst_QQuickVideoCropLayer : public QObject
 {
@@ -22,6 +26,7 @@ private slots:
     void busyPausedResize();
     void ordinary2D();
     void convertingArrivalsAndInvalidation();
+    void depthNativeSubmission();
 };
 
 static QVideoFrame frame(QVideoFrameFormat::StereoMode mode, bool second = false,
@@ -103,6 +108,123 @@ static bool submittedBuffer(int count, int width, int destination, int leftBlue,
                     return false;
             }
         }
+    }
+    return true;
+}
+
+
+// A picture with its depth map, side by side, the picture first (the depth layout of Matroska's
+// StereoMode 15): the picture 160x90 as frame() makes it (red the column, green the row, blue 80, or 180 in
+// the stripes of 8 columns), the depth map a constant in the green channel, which is where the depth of an RGBA frame is
+static QVideoFrame depthFrame(int depth)
+{
+    QVideoFrameFormat format(QSize(320, 90), QVideoFrameFormat::Format_RGBA8888);
+    // DepthSideBySide, by its number: the same source builds against a Qt Multimedia that does not know
+    // the depth layouts, whose compositor path must then fail on the frames (the control of the proof)
+    format.setStereoMode(QVideoFrameFormat::StereoMode(10));
+    format.setColorSpace(QVideoFrameFormat::ColorSpace_BT709);
+    format.setColorTransfer(QVideoFrameFormat::ColorTransfer_Gamma22);
+    format.setColorRange(QVideoFrameFormat::ColorRange_Full);
+    QVideoFrame result(format);
+    if (!result.map(QVideoFrame::WriteOnly))
+        return {};
+    for (int y = 0; y < 90; ++y) {
+        auto *row = result.bits(0) + y * result.bytesPerLine(0);
+        for (int x = 0; x < 320; ++x) {
+            row[4 * x] = x < 160 ? x : 0;
+            row[4 * x + 1] = x < 160 ? y : depth;
+            row[4 * x + 2] = x < 160 ? 80 + 100 * ((x >> 3) & 1) : 0;
+            row[4 * x + 3] = 255;
+        }
+    }
+    result.unmap();
+    result.setStartTime(1000);
+    return result;
+}
+
+// The rig captures the compositor's output while the test holds a phase: the test says it is ready
+// (CROP_HOLD_DIR/ready-PHASE) and goes on when the rig has captured (CROP_HOLD_DIR/done-PHASE)
+static void holdForCapture(const QString &phase)
+{
+    const QString directory = qEnvironmentVariable("CROP_HOLD_DIR");
+    if (directory.isEmpty())
+        return;
+    QFile ready(directory + u"/ready-" + phase);
+    if (!ready.open(QIODevice::WriteOnly))
+        return;
+    ready.close();
+    for (int i = 0; i < 300 && !QFile::exists(directory + u"/done-" + phase); ++i)
+        QTest::qWait(100);
+}
+
+// The last buffer the compositor was handed, for the views drawn from a depth map: full side by
+// side, left eye first, each eye at the size of the picture (cropped as the item crops it), every
+// sample the picture's own, so nothing was resized after the drawing. An eye is the picture itself
+// (shift 0) or the picture moved along its rows by one shift (the parallax of a constant depth),
+// whose rows are the picture's rows (the shift is the parallax rounded to a sample); the shifts are returned.
+// How many buffers the compositor was handed so far (a commit that only moves the window counts)
+static int commitCount()
+{
+    QFile log(qEnvironmentVariable("QT_STEREO_TEST_BUFFER_DIR") + u"/log.jsonl");
+    if (!log.open(QIODevice::ReadOnly))
+        return 0;
+    const auto data = log.readAll().trimmed();
+    return data.isEmpty() ? 0 : data.split('\n').size();
+}
+
+static bool submittedDepthViews(int count, int width, int destination, int *leftShift, int *rightShift)
+{
+    const QString directory = qEnvironmentVariable("QT_STEREO_TEST_BUFFER_DIR");
+    if (directory.isEmpty())
+        return false;
+    QFile log(directory + u"/log.jsonl");
+    if (!log.open(QIODevice::ReadOnly))
+        return false;
+    const auto lines = log.readAll().trimmed().split('\n');
+    if (lines.size() != count) {
+        qWarning() << "Submitted buffers" << lines.size() << "expected" << count;
+        return false;
+    }
+    const auto entry = QJsonDocument::fromJson(lines.last()).object();
+    const auto target = entry.value("destination").toArray();
+    if (entry.value("width").toInt() != width || entry.value("height").toInt() != 90
+            || entry.value("format").toInt() != 1 || entry.value("content").toInt() != 3
+            || target.size() != 2 || target[0].toInt() != destination || target[1].toInt() != 120) {
+        qWarning() << "Submitted buffer is" << entry;
+        return false;
+    }
+    QFile buffer(directory + u'/' + entry.value("file").toString());
+    if (!buffer.open(QIODevice::ReadOnly))
+        return false;
+    const auto bytes = buffer.readAll();
+    const int stride = entry.value("stride").toInt();
+    if (stride < width * 4 || bytes.size() != stride * 90)
+        return false;
+    const int viewWidth = width / 2;
+    const int x0 = (160 - viewWidth) / 2;
+    const int border = 8;
+    for (int eye = 0; eye < 2; ++eye) {
+        auto sample = [&](int x, int y, int channel) {
+            return reinterpret_cast<const uchar *>(bytes.constData())[y * stride + (eye * viewWidth + x) * 4 + channel];
+        };
+        const int shift = sample(viewWidth / 2, 45, 2) - (x0 + viewWidth / 2);
+        for (int y = 0; y < 90; ++y) {
+            for (int x = border; x < viewWidth - border; ++x) {
+                // the views are drawn with the fractional parallax of the depth map: the ramp of the red
+                // channel and the rows are exact, and so is the blue of the stripes but within one sample
+                // of a stripe's edge, where it lies between the two stripes
+                const int source = x0 + x + shift;
+                const int blue = sample(x, y, 0);
+                const bool edge = (source & 7) == 0 || (source & 7) == 7;
+                const bool blueOk = edge ? (blue >= 80 && blue <= 180) : blue == 80 + 100 * ((source >> 3) & 1);
+                if (!blueOk || sample(x, y, 1) != y || sample(x, y, 2) != source) {
+                    qWarning() << "Eye" << eye << "sample" << x << y << "is" << blue << sample(x, y, 1)
+                               << sample(x, y, 2) << "with the shift" << shift;
+                    return false;
+                }
+            }
+        }
+        (eye ? *rightShift : *leftShift) = shift;
     }
     return true;
 }
@@ -445,6 +567,63 @@ void tst_QQuickVideoCropLayer::convertingArrivalsAndInvalidation()
     output.setWidth(160);
     output.videoSink()->setVideoFrame(frame(QVideoFrameFormat::StereoMode::SideBySide));
     QTest::qWait(200);
+}
+
+// The compositor path with a depth video: the views drawn from the picture and its depth map reach
+// the compositor as the full side by side the layer declares, the left eye first, each eye the
+// picture's own samples; the screen at the depth of 128, so that the first frame has no parallax
+void tst_QQuickVideoCropLayer::depthNativeSubmission()
+{
+    if (QGuiApplication::platformName() != u"wayland")
+        QSKIP("Requires an isolated Wayland stereo compositor");
+    if (!qEnvironmentVariableIsSet("QT_STEREO_TEST_BUFFER_DIR"))
+        QSKIP("Requires an observing adapter for native submitted buffers");
+    QQuickWindow window;
+    auto format = window.format();
+    format.setAlphaBufferSize(8);
+    window.setFormat(format);
+    window.resize(160, 120);
+    QQuickVideoOutput output;
+    output.setParentItem(window.contentItem());
+    output.setSize(QSizeF(160, 120));
+    output.setFillMode(QQuickVideoOutput::PreserveAspectCrop);
+    // by name: a compositor without the depth layouts must fail on the frames, not on the property
+    output.setProperty("stereoDepthZero", 128.0 / 255.0);
+    window.show();
+    if (!output.stereoLayerSupported())
+        QSKIP("The compositor does not expose the stereo layer contract");
+    int left = 99, right = 99;
+    qInfo("CROP_PHASE depth-screen-plane");
+    output.videoSink()->setVideoFrame(depthFrame(128));
+    QTRY_VERIFY_WITH_TIMEOUT(output.stereoVideo(), 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(output.stereoLayerActive(), 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(commitCount() > 0, 8000);
+    QTest::qWait(250);
+    QVERIFY(submittedDepthViews(commitCount(), 240, 160, &left, &right));
+    QCOMPARE(left, 0);
+    QCOMPARE(right, 0);
+    holdForCapture(u"screen-plane"_s);
+    qInfo("CROP_PHASE depth-near");
+    int commits = commitCount();
+    output.videoSink()->setVideoFrame(depthFrame(255));
+    QTRY_VERIFY_WITH_TIMEOUT(commitCount() > commits, 8000);
+    QTest::qWait(250);
+    QVERIFY(submittedDepthViews(commits + 1, 240, 160, &left, &right));
+    QCOMPARE(left, 0);
+    QVERIFY2(right != 0 && std::abs(right) <= 5, qPrintable(QString::number(right))); // 58 pixels at 1920, 160 wide
+    holdForCapture(u"near"_s);
+    qInfo("CROP_PHASE depth-near-swapped");
+    commits = commitCount();
+    output.setStereoSwapEyes(true);
+    QTRY_VERIFY_WITH_TIMEOUT(commitCount() > commits, 8000);
+    QTest::qWait(250);
+    QVERIFY(submittedDepthViews(commits + 1, 240, 160, &left, &right));
+    QVERIFY(left != 0 && std::abs(left) <= 5);
+    QCOMPARE(right, 0);
+    qInfo("CROP_PHASE depth-cleared");
+    output.videoSink()->setVideoFrame(QVideoFrame());
+    QTest::qWait(150);
+    QVERIFY(!output.stereoLayerActive());
 }
 
 QTEST_MAIN(tst_QQuickVideoCropLayer)
