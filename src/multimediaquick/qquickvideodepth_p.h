@@ -82,6 +82,7 @@ struct Q_MULTIMEDIAQUICK_EXPORT Choice
     int skippedWarp = -1, skippedFill = -1;
     double skippedMs = 0;
     bool onGpu = false;
+    bool gpuLost = false; // the GPU was reset while drawing: it is not used again for this video
     QString gpu; // the GPU's name, or the processor's
 
     bool operator==(const Choice &o) const;

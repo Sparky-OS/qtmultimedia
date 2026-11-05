@@ -94,7 +94,7 @@ bool Choice::operator==(const Choice &o) const
 {
     return valid == o.valid && warp == o.warp && fill == o.fill && keepsUp == o.keepsUp
             && qFuzzyCompare(fps + 1, o.fps + 1) && skippedWarp == o.skippedWarp
-            && skippedFill == o.skippedFill && onGpu == o.onGpu && gpu == o.gpu;
+            && skippedFill == o.skippedFill && onGpu == o.onGpu && gpuLost == o.gpuLost && gpu == o.gpu && skippedMs == o.skippedMs;
 }
 
 bool canDraw()
@@ -539,6 +539,10 @@ public:
     // one thread). Returns false with the reason.
     bool ensure(QString *why)
     {
+        if (m_lost) {
+            *why = QStringLiteral("the GPU was reset while drawing, it is not used again for this video");
+            return false;
+        }
         if (m_gl && m_thread == QThread::currentThread())
             return true;
         if (m_failedThread == QThread::currentThread()) {
@@ -551,12 +555,15 @@ public:
         QSurfaceFormat format;
         format.setVersion(3, 3);
         format.setProfile(QSurfaceFormat::CoreProfile);
+        // a context that tells when the GPU was reset (KHR_robustness): the library watches it (stereo_dibr_gl_reset_status())
+        format.setOption(QSurfaceFormat::ResetNotification);
         context->setFormat(format);
         if (!context->create()) {
             // OpenGL ES 3.0, for a platform that has no desktop OpenGL
             format = QSurfaceFormat();
             format.setRenderableType(QSurfaceFormat::OpenGLES);
             format.setVersion(3, 0);
+            format.setOption(QSurfaceFormat::ResetNotification);
             context->setFormat(format);
             if (!context->create())
                 return fail(QStringLiteral("no OpenGL 3.3 or OpenGL ES 3.0 context could be made"), why);
@@ -596,6 +603,7 @@ public:
             m_context->doneCurrent();
     }
     stereo_dibr_gl *gl() const { return m_gl; }
+    bool lost() const { return m_lost; }
     bool isEs() const { return m_context && m_context->isOpenGLES(); }
 
     // The views of a picture and its depth map into result (RGBA 8 bit, twice the picture's
@@ -635,6 +643,8 @@ public:
                                       m_tex[Depth].id, dparts.depth.width, dparts.depth.height, 0,
                                       m_tex[Target].id, hole);
         if (r < 0) {
+            if (r == -4 || stereo_dibr_gl_reset_status(m_gl))
+                m_lost = true;
             *why = QString::fromLatin1(stereo_dibr_gl_error(m_gl));
             if (why->isEmpty())
                 *why = QStringLiteral("the views could not be drawn");
@@ -883,6 +893,7 @@ private:
     QObject m_executor;
     std::array<Tex, NbTextures> m_tex;
     unsigned m_vao = 0, m_fbo = 0, m_convert = 0, m_channel = 0;
+    bool m_lost = false;
 };
 
 #endif // QT_MM_DEPTH_GPU
@@ -909,6 +920,7 @@ struct Renderer::Private
         bool gpu = false;
         QString key;
         int w = 0, h = 0;
+        double fps = 0;
         std::vector<double> ms;
     } timing;
     // what the log was told last, so that it says it when it changes and not for every frame
@@ -987,22 +999,24 @@ struct Renderer::Private
         if (gpuEngine)
             key = QString::fromLatin1(stereo_dibr_gl_gpu(gpu.gl()));
 #endif
+        // the ladder is timed from the cheapest way up for this frame rate, and goes on when a lower one leaves room
         if (!timing.ok || timing.gpu != gpuEngine || timing.key != key || timing.w != w
-            || timing.h != h) {
+            || timing.h != h || std::abs(timing.fps - fps) > 0.01) {
             std::vector<double> ms(size_t(n), -1.0);
             int measured = 0, r = -1;
 #ifdef QT_MM_DEPTH_GPU
             if (gpuEngine)
-                r = stereo_dibr_gl_measure(gpu.gl(), w, h, 1, ms.data(), n, &measured);
+                r = stereo_dibr_gl_measure(gpu.gl(), w, h, 1, fps, ms.data(), n, &measured);
 #endif
             if (!gpuEngine)
-                r = stereo_dibr_measure_cpu(w, h, ms.data(), n, &measured);
+                r = stereo_dibr_measure_cpu(w, h, fps, ms.data(), n, &measured);
             if (r < 0)
                 return false;
-            timing = { true, gpuEngine, key, w, h, ms };
+            timing = { true, gpuEngine, key, w, h, fps, ms };
             QStringList times;
             for (double t : ms)
-                times << QString::number(t, 'f', 1);
+                times << (t == -2.0 ? QStringLiteral("no-memory") : t < 0 ? QStringLiteral("not-timed")
+                                                                            : QString::number(t, 'f', 1));
             qCInfo(qLcVideoDepth).noquote()
                     << (measured ? QStringLiteral("timed") : QStringLiteral("took from the cache"))
                     << "the ways of drawing the views of a depth video on" << key << "at" << w << "x"
@@ -1388,6 +1402,11 @@ Renderer::Result Renderer::draw(const QVideoFrame &input, Mode mode, bool depthF
                true);
         QString why;
         o = d->render(input, mode, depthFirst, fileMark, options, false, out, &why);
+#ifdef QT_MM_DEPTH_GPU
+        // a GPU that was reset is said in the choice, so that the controls say it
+        if (o == Private::Outcome::Drawn && d->gpu.lost())
+            d->choice.gpuLost = true;
+#endif
     }
     switch (o) {
     case Private::Outcome::Drawn:

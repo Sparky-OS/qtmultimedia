@@ -1260,6 +1260,7 @@ void QQuickVideoOutput::setDepthChoice(const QQuickVideoDepth::Choice &choice)
         map.insert(QStringLiteral("skippedFill"), choice.skippedFill);
         map.insert(QStringLiteral("skippedMs"), choice.skippedMs);
         map.insert(QStringLiteral("onGpu"), choice.onGpu);
+        map.insert(QStringLiteral("gpuLost"), choice.gpuLost);
         map.insert(QStringLiteral("gpu"), choice.gpu);
     }
     {
