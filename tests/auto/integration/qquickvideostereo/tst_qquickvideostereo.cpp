@@ -14,7 +14,12 @@
 #include <QtMultimediaQuick/private/qquickvideostereo_p.h>
 #include <QtMultimediaQuick/private/qquickvideodepth_p.h>
 #include <QtCore/qrandom.h>
+#include <QtGui/qguiapplication.h>
+#include <QtGui/qtransform.h>
+#include <QtQuick/qquickwindow.h>
 
+#include <algorithm>
+#include <cmath>
 #include <set>
 
 using namespace QQuickVideoStereo;
@@ -67,6 +72,13 @@ private slots:
     void depthLayouts();
     void depthMarks();
     void depthInVideoOutput();
+    void depthRotated_data();
+    void depthRotated();
+    void depthRotatedFormats_data();
+    void depthRotatedFormats();
+    void depthRotatedInVideoOutput();
+    void depthRotatedDrawn_data();
+    void depthRotatedDrawn();
 };
 
 void tst_QQuickVideoStereo::sizes_data()
@@ -586,6 +598,300 @@ void tst_QQuickVideoStereo::depthInVideoOutput()
     sink->setVideoFrame(unmarked);
     QTRY_COMPARE(output.stereoPacking(), QQuickVideoOutput::StereoDepthTopBottom);
     QTRY_COMPARE(output.implicitHeight(), qreal(h));
+}
+
+namespace {
+
+// The luma of a region of a mapped planar frame
+QImage lumaOf(const QVideoFrame &frame, QRect region)
+{
+    QVideoFrame f = frame;
+    QImage image(region.size(), QImage::Format_Grayscale8);
+    if (!f.map(QVideoFrame::ReadOnly))
+        return {};
+    for (int y = 0; y < region.height(); ++y)
+        memcpy(image.scanLine(y), f.bits(0) + (region.y() + y) * f.bytesPerLine(0) + region.x(),
+               region.width());
+    f.unmap();
+    return image;
+}
+
+// A picture turned as a frame asks for it: clockwise by the degrees, then mirrored horizontally
+QImage turned(const QImage &gray, int degrees, bool mirrored)
+{
+    QImage result = degrees ? gray.transformed(QTransform().rotate(degrees)) : gray;
+    return mirrored ? result.mirrored(true, false) : result;
+}
+
+// Where a pixel of the picture is after it is turned so
+QPoint turnedPoint(QPoint p, QSize size, int degrees, bool mirrored)
+{
+    QPoint q = p;
+    switch (degrees) {
+    case 90:
+        q = QPoint(size.height() - 1 - p.y(), p.x());
+        break;
+    case 180:
+        q = QPoint(size.width() - 1 - p.x(), size.height() - 1 - p.y());
+        break;
+    case 270:
+        q = QPoint(p.y(), size.width() - 1 - p.x());
+        break;
+    default:
+        break;
+    }
+    if (mirrored)
+        q.setX((degrees % 180 ? size.height() : size.width()) - 1 - q.x());
+    return q;
+}
+
+// The same picture and depth map as the frame of depthFrame(), each turned by the pixels, as a
+// video that was recorded the right way up would hold them (the control of a rotated frame)
+QVideoFrame preTurnedDepthFrame(const QVideoFrame &source, int w, int h, int degrees, bool mirrored)
+{
+    const QImage picture = turned(lumaOf(source, QRect(0, 0, w, h)), degrees, mirrored);
+    const QImage depth = turned(lumaOf(source, QRect(w, 0, w, h)), degrees, mirrored);
+    QVideoFrameFormat format(QSize(2 * picture.width(), picture.height()), QVideoFrameFormat::Format_YUV444P);
+    format.setColorRange(QVideoFrameFormat::ColorRange_Full);
+    format.setStereoMode(Mode::DepthSideBySide);
+    QVideoFrame frame(format);
+    if (!frame.map(QVideoFrame::WriteOnly))
+        return {};
+    for (int y = 0; y < picture.height(); ++y) {
+        for (int x = 0; x < picture.width(); ++x) {
+            frame.bits(0)[y * frame.bytesPerLine(0) + x] = picture.constScanLine(y)[x];
+            frame.bits(0)[y * frame.bytesPerLine(0) + picture.width() + x] = depth.constScanLine(y)[x];
+        }
+        for (int x = 0; x < 2 * picture.width(); ++x) {
+            frame.bits(1)[y * frame.bytesPerLine(1) + x] = 128;
+            frame.bits(2)[y * frame.bytesPerLine(2) + x] = 128;
+        }
+    }
+    frame.unmap();
+    return frame;
+}
+
+} // namespace
+
+namespace {
+
+// A picture and its depth map side by side, from two gray images, in a pixel format with chroma
+// subsampling (YUV 4:2:0) or interleaved samples (BGRA, the depth in green)
+QVideoFrame grayDepthFrame(const QImage &picture, const QImage &depth, QVideoFrameFormat::PixelFormat pixelFormat)
+{
+    const int w = picture.width(), h = picture.height();
+    QVideoFrameFormat format(QSize(2 * w, h), pixelFormat);
+    format.setColorRange(QVideoFrameFormat::ColorRange_Full);
+    format.setStereoMode(Mode::DepthSideBySide);
+    QVideoFrame frame(format);
+    if (!frame.map(QVideoFrame::WriteOnly))
+        return {};
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < 2 * w; ++x) {
+            const uchar v = x < w ? picture.constScanLine(y)[x] : depth.constScanLine(y)[x - w];
+            if (pixelFormat == QVideoFrameFormat::Format_BGRA8888) {
+                uchar *px = frame.bits(0) + y * frame.bytesPerLine(0) + 4 * x;
+                px[0] = px[1] = px[2] = v;
+                px[3] = 255;
+            } else {
+                frame.bits(0)[y * frame.bytesPerLine(0) + x] = v;
+            }
+        }
+    if (pixelFormat == QVideoFrameFormat::Format_YUV420P)
+        for (int plane = 1; plane <= 2; ++plane)
+            for (int y = 0; y < h / 2; ++y)
+                memset(frame.bits(plane) + y * frame.bytesPerLine(plane), 128, w);
+    frame.unmap();
+    return frame;
+}
+
+// The picture of a frame of grayDepthFrame(), the pixels of one component
+QImage componentOf(const QVideoFrame &frame, QRect region, int component)
+{
+    QVideoFrame f = frame;
+    QImage image(region.size(), QImage::Format_Grayscale8);
+    if (!f.map(QVideoFrame::ReadOnly))
+        return {};
+    const bool bgra = f.pixelFormat() == QVideoFrameFormat::Format_BGRA8888;
+    for (int y = 0; y < region.height(); ++y)
+        for (int x = 0; x < region.width(); ++x)
+            image.scanLine(y)[x] = bgra ? f.bits(0)[(region.y() + y) * f.bytesPerLine(0) + 4 * (region.x() + x) + component]
+                                        : f.bits(0)[(region.y() + y) * f.bytesPerLine(0) + region.x() + x];
+    f.unmap();
+    return image;
+}
+
+} // namespace
+
+void tst_QQuickVideoStereo::depthRotatedFormats_data()
+{
+    QTest::addColumn<int>("pixelFormat");
+    QTest::addColumn<int>("degrees");
+    QTest::newRow("YUV 4:2:0, 90") << int(QVideoFrameFormat::Format_YUV420P) << 90;
+    QTest::newRow("YUV 4:2:0, 270") << int(QVideoFrameFormat::Format_YUV420P) << 270;
+    QTest::newRow("YUV 4:2:0, 180") << int(QVideoFrameFormat::Format_YUV420P) << 180;
+    QTest::newRow("BGRA, 90") << int(QVideoFrameFormat::Format_BGRA8888) << 90;
+    QTest::newRow("BGRA, 180") << int(QVideoFrameFormat::Format_BGRA8888) << 180;
+}
+
+// The formats whose samples are subsampled or interleaved are turned plane by plane: the drawn frame
+// keeps the pixel format and the picture is the turned one (the parallax is checked for the planar
+// format, whose luma the block matching reads)
+void tst_QQuickVideoStereo::depthRotatedFormats()
+{
+    if (!QQuickVideoDepth::canDraw())
+        QSKIP("built without libstereo-dibr");
+    QFETCH(int, pixelFormat);
+    QFETCH(int, degrees);
+    const int w = 240, h = 136;
+    const QVideoFrame luma = depthFrame(Mode::DepthSideBySide, false, w, h);
+    const QImage picture = lumaOf(luma, QRect(0, 0, w, h));
+    const QImage depth = lumaOf(luma, QRect(w, 0, w, h));
+    QVideoFrame frame = grayDepthFrame(picture, depth, QVideoFrameFormat::PixelFormat(pixelFormat));
+    QVERIFY(frame.isValid());
+    frame.setRotation(QtVideo::Rotation(degrees));
+    const QSize shown = degrees % 180 ? QSize(h, w) : QSize(w, h);
+    QQuickVideoDepth::Renderer renderer;
+    QVideoFrame pair;
+    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, {}, {}, &pair),
+             QQuickVideoDepth::Renderer::Result::Drawn);
+    QCOMPARE(pair.size(), QSize(2 * shown.width(), shown.height()));
+    QCOMPARE(int(pair.pixelFormat()), pixelFormat);
+    QCOMPARE(componentOf(pair, QRect(QPoint(0, 0), shown), 1), turned(picture, degrees, false));
+    if (pixelFormat == QVideoFrameFormat::Format_YUV420P) {
+        const QPoint box = turnedPoint(QPoint(w * 3 / 8, h / 2), QSize(w, h), degrees, false);
+        QCOMPARE(shiftAt(pair, box.y(), box.x(), 12), qRound(expectedParallax({}, 160, shown.width())));
+    }
+}
+
+void tst_QQuickVideoStereo::depthRotated_data()
+{
+    QTest::addColumn<int>("degrees");
+    QTest::addColumn<bool>("mirrored");
+    QTest::newRow("90") << 90 << false;
+    QTest::newRow("180") << 180 << false;
+    QTest::newRow("270") << 270 << false;
+    QTest::newRow("90, mirrored") << 90 << true;
+    QTest::newRow("180, mirrored") << 180 << true;
+}
+
+// A depth video recorded sideways or upside down: its two views are drawn the right way up, with
+// the parallax along the width of the picture as it is shown, and no rotation is left on them
+void tst_QQuickVideoStereo::depthRotated()
+{
+    if (!QQuickVideoDepth::canDraw())
+        QSKIP("built without libstereo-dibr");
+    QFETCH(int, degrees);
+    QFETCH(bool, mirrored);
+    const int w = 240, h = 136;
+    QVideoFrame frame = depthFrame(Mode::DepthSideBySide, false, w, h);
+    QVERIFY(frame.isValid());
+    const QImage picture = lumaOf(frame, QRect(0, 0, w, h));
+    frame.setRotation(QtVideo::Rotation(degrees));
+    frame.setMirrored(mirrored);
+    const QSize shown = degrees % 180 ? QSize(h, w) : QSize(w, h);
+
+    QQuickVideoDepth::Renderer renderer;
+    QVideoFrame pair;
+    QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, {}, {}, &pair),
+             QQuickVideoDepth::Renderer::Result::Drawn);
+    QCOMPARE(pair.size(), QSize(2 * shown.width(), shown.height()));
+    QCOMPARE(pair.rotation(), QtVideo::Rotation::None);
+    QVERIFY(!pair.mirrored());
+    QCOMPARE(pair.surfaceFormat().rotation(), QtVideo::Rotation::None);
+    QVERIFY(!pair.surfaceFormat().isMirrored());
+    // the left eye is the picture, turned: to the sample
+    QCOMPARE(lumaOf(pair, QRect(QPoint(0, 0), shown)), turned(picture, degrees, mirrored));
+    // the background (64) and the box (160) at their parallax along the shown width
+    const QPoint background = turnedPoint(QPoint(w * 3 / 4, h / 8), QSize(w, h), degrees, mirrored);
+    const QPoint box = turnedPoint(QPoint(w * 3 / 8, h / 2), QSize(w, h), degrees, mirrored);
+    QCOMPARE(shiftAt(pair, background.y(), background.x(), 12),
+             qRound(expectedParallax({}, 64, shown.width())));
+    QCOMPARE(shiftAt(pair, box.y(), box.x(), 12), qRound(expectedParallax({}, 160, shown.width())));
+}
+
+// The size a rotated depth video is shown at is the turned picture's
+void tst_QQuickVideoStereo::depthRotatedInVideoOutput()
+{
+    QQuickVideoOutput output;
+    const int w = 240, h = 136;
+    QVideoFrame frame = depthFrame(Mode::DepthSideBySide, false, w, h);
+    frame.setRotation(QtVideo::Rotation::Clockwise90);
+    output.videoSink()->setVideoFrame(frame);
+    QTRY_COMPARE(output.stereoPacking(), QQuickVideoOutput::StereoDepthSideBySide);
+    QTRY_COMPARE(output.implicitWidth(), qreal(h));
+    QCOMPARE(output.implicitHeight(), qreal(w));
+    // the picture alone, and the frame as stored, keep turning with the frame
+    output.setStereoDepth(false);
+    QTRY_COMPARE(output.implicitWidth(), qreal(h));
+    QCOMPARE(output.implicitHeight(), qreal(w));
+    output.setStereoView(QQuickVideoOutput::StereoFlat);
+    QTRY_COMPARE(output.implicitWidth(), qreal(h));
+    QCOMPARE(output.implicitHeight(), qreal(2 * w));
+}
+
+void tst_QQuickVideoStereo::depthRotatedDrawn_data()
+{
+    QTest::addColumn<int>("degrees");
+    QTest::addColumn<bool>("mirrored");
+    QTest::newRow("90") << 90 << false;
+    QTest::newRow("180") << 180 << false;
+    QTest::newRow("270") << 270 << false;
+    QTest::newRow("90, mirrored") << 90 << true;
+}
+
+// What the scene graph shows of each eye of a rotated depth video is what it shows of the same
+// video recorded the right way up (the control: the frame turned by its pixels)
+void tst_QQuickVideoStereo::depthRotatedDrawn()
+{
+    if (!QQuickVideoDepth::canDraw())
+        QSKIP("built without libstereo-dibr");
+    if (QGuiApplication::platformName() == u"minimal" || QGuiApplication::platformName() == u"offscreen")
+        QSKIP("Requires a platform with a window to render");
+    QFETCH(int, degrees);
+    QFETCH(bool, mirrored);
+    const int w = 240, h = 136;
+    const QSize shown = degrees % 180 ? QSize(h, w) : QSize(w, h);
+    QQuickWindow window;
+    window.resize(shown);
+    window.setColor(Qt::black);
+    QQuickVideoOutput output;
+    output.setParentItem(window.contentItem());
+    output.setSize(QSizeF(shown));
+    output.setFillMode(QQuickVideoOutput::Stretch);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+    const QVideoFrame upright = depthFrame(Mode::DepthSideBySide, false, w, h);
+    QVideoFrame rotated = upright;
+    rotated.setRotation(QtVideo::Rotation(degrees));
+    rotated.setMirrored(mirrored);
+    const QVideoFrame control = preTurnedDepthFrame(upright, w, h, degrees, mirrored);
+    QVERIFY(control.isValid());
+
+    for (auto eye : { QQuickVideoOutput::StereoLeftEye, QQuickVideoOutput::StereoRightEye }) {
+        output.setStereoView(eye);
+        output.videoSink()->setVideoFrame(control);
+        QTest::qWait(300);
+        const QImage expected = window.grabWindow().convertToFormat(QImage::Format_RGB32);
+        output.videoSink()->setVideoFrame(rotated);
+        QTest::qWait(300);
+        const QImage actual = window.grabWindow().convertToFormat(QImage::Format_RGB32);
+        QCOMPARE(actual.size(), expected.size());
+        QVERIFY(!actual.isNull());
+        // a blank frame is no witness: the picture is noise
+        QVERIFY(actual.pixelColor(shown.width() / 2, shown.height() / 2)
+                != actual.pixelColor(shown.width() / 2 + 3, shown.height() / 2 + 5)
+                || actual.pixelColor(10, 10) != actual.pixelColor(30, 40));
+        int worst = 0;
+        for (int y = 0; y < actual.height(); ++y)
+            for (int x = 0; x < actual.width(); ++x) {
+                const QRgb a = actual.pixel(x, y), b = expected.pixel(x, y);
+                worst = std::max({ worst, std::abs(qRed(a) - qRed(b)), std::abs(qGreen(a) - qGreen(b)),
+                                   std::abs(qBlue(a) - qBlue(b)) });
+            }
+        QVERIFY2(worst <= 2, qPrintable(u"largest difference %1 in eye %2"_s.arg(worst).arg(int(eye))));
+    }
 }
 
 QTEST_MAIN(tst_QQuickVideoStereo)
