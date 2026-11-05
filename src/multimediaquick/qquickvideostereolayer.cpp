@@ -388,19 +388,6 @@ bool QQuickVideoStereoLayer::hasColorManagement() const
     return d->colorSurface != nullptr;
 }
 
-void QQuickVideoStereoLayer::setRect(const QRect &rect)
-{
-    QMutexLocker lock(&d->mutex);
-    if (d->rect == rect)
-        return;
-    d->rect = rect;
-    if (d->mapped) {
-        d->place();
-        wl_surface_commit(d->surface);
-        wl_display_flush(d->display);
-    }
-}
-
 void QQuickVideoStereoLayer::Private::place()
 {
     if (rect.isEmpty())
@@ -464,13 +451,15 @@ void QQuickVideoStereoLayer::setColor(const Color &color)
     wp_image_description_v1_destroy(description);
 }
 
-void QQuickVideoStereoLayer::present(const QImage &left, const QImage &right, BufferFormat format)
+bool QQuickVideoStereoLayer::present(const QImage &left, const QImage &right, BufferFormat format,
+                                    const QRect &rect)
 {
     if (left.isNull() || left.size() != right.size())
-        return;
+        return false;
     QMutexLocker lock(&d->mutex);
+    d->rect = rect;
     if (d->rect.isEmpty())
-        return;
+        return false;
     // Nothing is listened to on the queue of the layer but the release of buffers
     d->dispatch();
 
@@ -487,7 +476,7 @@ void QQuickVideoStereoLayer::present(const QImage &left, const QImage &right, Bu
         break;
     }
     if (!buffer)
-        return; // the compositor holds them all: this frame is dropped
+        return false; // the compositor holds them all: retry after release, including paused updates
 
     writePair(left, right, format, buffer->data, pixels.width() * bytesPerPixel(format));
 
@@ -505,6 +494,7 @@ void QQuickVideoStereoLayer::present(const QImage &left, const QImage &right, Bu
     wl_surface_commit(d->surface);
     wl_display_flush(d->display);
     d->mapped = true;
+    return true;
 }
 
 void QQuickVideoStereoLayer::hide()
@@ -534,8 +524,8 @@ QQuickVideoStereo::BufferFormat QQuickVideoStereoLayer::chooseFormat(QQuickVideo
 {
     return QQuickVideoStereo::BufferFormat::Xrgb8888;
 }
-void QQuickVideoStereoLayer::setRect(const QRect &) { }
-void QQuickVideoStereoLayer::present(const QImage &, const QImage &, QQuickVideoStereo::BufferFormat) { }
+bool QQuickVideoStereoLayer::present(const QImage &, const QImage &, QQuickVideoStereo::BufferFormat,
+                                    const QRect &) { return false; }
 void QQuickVideoStereoLayer::hide() { }
 void QQuickVideoStereoLayer::setColor(const Color &) { }
 bool QQuickVideoStereoLayer::hasColorManagement() const { return false; }

@@ -185,6 +185,15 @@ public:
     \brief The QQuickVideoOutput class provides a video output item.
 */
 
+// Frame ownership belongs to VideoOutput, not a temporary window presenter.
+// Kept opaque in the header so builds without the Wayland layer retain its layout.
+struct QQuickVideoOutput::StereoPair
+{
+#ifdef QT_MM_STEREO_LAYER
+    QQuickVideoStereoPresenter::Job job;
+#endif
+};
+
 QQuickVideoOutput::QQuickVideoOutput(QQuickItem *parent) :
     QQuickItem(parent)
 {
@@ -768,8 +777,8 @@ void QQuickVideoOutput::ensureStereoPresenter()
     if (!presenter->isValid())
         return;
     const QPoint margins(m_window->frameMargins().left(), m_window->frameMargins().top());
-    m_stereoRect = mapRectToScene(m_contentRect).toRect().translated(margins);
-    presenter->setRect(m_stereoRect);
+    m_stereoRect = mapRectToScene(fillMode() == PreserveAspectCrop ? boundingRect() : m_contentRect).toRect().translated(margins);
+    presenter->setGeometry({ m_stereoRect, fillMode() == PreserveAspectCrop });
     {
         QMutexLocker lock(&m_frameMutex);
         m_stereoPresenter = std::move(presenter);
@@ -782,6 +791,15 @@ void QQuickVideoOutput::ensureStereoPresenter()
 void QQuickVideoOutput::_q_syncStereoLayer()
 {
 #ifdef QT_MM_STEREO_LAYER
+    const bool cropGeometrySupported = QQuickVideoStereo::canCropLayer(this);
+    bool geometryChanged;
+    {
+        QMutexLocker lock(&m_frameMutex);
+        geometryChanged = m_stereo.cropGeometrySupported != cropGeometrySupported;
+        m_stereo.cropGeometrySupported = cropGeometrySupported;
+    }
+    if (geometryChanged)
+        reprocessFrame();
     bool wanted;
     {
         QMutexLocker lock(&m_frameMutex);
@@ -802,21 +820,19 @@ void QQuickVideoOutput::_q_syncStereoLayer()
         ensureStereoPresenter();
         return;
     }
-    if (!m_window || !isVisible() || !m_window->isVisible() || opacity() <= 0) {
+    bool hidden = !m_window || !isVisible() || !m_window->isVisible();
+    for (QQuickItem *item = this; item; item = item->parentItem())
+        hidden = hidden || item->opacity() <= 0;
+    if (hidden) {
         m_stereoPresenter->hide();
         m_stereoRect = {};
         return;
     }
     // The surface of the window holds its frame, if the window has one
     const QPoint margins(m_window->frameMargins().left(), m_window->frameMargins().top());
-    const QRect rect = mapRectToScene(m_contentRect).toRect().translated(margins);
-    if (rect != m_stereoRect) {
-        const bool wasHidden = m_stereoRect.isEmpty();
-        m_stereoRect = rect;
-        m_stereoPresenter->setRect(rect);
-        if (wasHidden)
-            reprocessFrame();
-    }
+    const QRect rect = mapRectToScene(fillMode() == PreserveAspectCrop ? boundingRect() : m_contentRect).toRect().translated(margins);
+    m_stereoRect = rect;
+    m_stereoPresenter->setGeometry({ rect, fillMode() == PreserveAspectCrop });
 #endif
 }
 
@@ -1020,7 +1036,7 @@ QSGNode *QQuickVideoOutput::updatePaintNode(QSGNode *oldNode,
             delete oldNode;
             hole = new StereoHoleNode;
         }
-        hole->setRect(m_contentRect);
+        hole->setRect(fillMode() == PreserveAspectCrop ? boundingRect() : m_contentRect);
         m_frameChanged = false;
         m_frame = QVideoFrame();
         return hole;
@@ -1149,6 +1165,7 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
     // Stereoscopic 3D: which packing the frames have, and what is to be shown of it
     Packing packing;
     bool twoViews = false;
+    bool baseOnly = false;
     bool skip = false;
     int eye = 0;
     StereoState result = st;
@@ -1167,7 +1184,7 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
         packing.mode = format.stereoMode();
         packing.rightEyeFirst = format.stereoFlags().testFlag(QVideoFrameFormat::StereoFlag::RightEyeFirst);
         const bool multiview = format.stereoFlags().testFlag(QVideoFrameFormat::StereoFlag::Multiview);
-        const bool baseOnly = multiview && (st.input == StereoNone || st.view == StereoFlat);
+        baseOnly = multiview && (st.input == StereoNone || st.view == StereoFlat);
         if (multiview)
             packing.size = Size::Full;
         if (st.input != StereoAutomatic && !baseOnly) {
@@ -1188,10 +1205,32 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
         if (!twoViews)
             result.sequence = 0;
 
+#ifdef QT_MM_STEREO_LAYER
+        if (!repeated) {
+            QMutexLocker lock(&m_frameMutex);
+            auto previous = m_stereoLastFrame.surfaceFormat();
+            auto incoming = format;
+            previous.setStereoView(QVideoFrameFormat::StereoView::Packed);
+            incoming.setStereoView(QVideoFrameFormat::StereoView::Packed);
+            if (m_stereoLastFrame.isValid()
+                    && (previous != incoming || result.packing != st.packing)) {
+                ++m_stereoSourceSerial;
+                m_stereoPair.reset();
+                m_stereoHeldFrame = {};
+                m_stereoHeldEye = -1;
+                st.sequence = result.sequence = 0;
+                st.lastView = result.lastView = -1;
+                st.viewVaries = result.viewVaries = false;
+                if (m_stereoPresenter)
+                    m_stereoPresenter->clear();
+            }
+        }
+#endif
         const auto transformation = qNormalizedFrameTransformation(frame, orientation);
-        // a surface of its own is a rectangle of the window: it cannot be cropped by the item, rotated or mirrored
+        // The presenter crops both native views; frame rotation and mirroring still use the scene graph.
         const bool plain = transformation.rotation == QtVideo::Rotation::None
-                && !transformation.mirroredHorizontallyAfterRotation && !mirrored && !cropped;
+                && !transformation.mirroredHorizontallyAfterRotation && !mirrored
+                && (!cropped || st.cropGeometrySupported);
         const bool rightFirst = packing.rightEyeFirst != (baseOnly ? false : st.swapEyes);
         if (twoViews && packing.mode == StereoMode::FrameSequence) {
             // The eye this frame is for. Frames that say it, and say it differently from one
@@ -1225,34 +1264,35 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
                                                          format.colorRange(), format.maxLuminance() });
         result.layerActive = result.layerWanted && presenterReady;
         shownInLayer = result.layerActive;
-        bool submit = result.layerActive;
+        bool resolved = twoViews && !baseOnly;
         QVideoFrame otherFrame;
-        if (result.layerActive && packing.mode == StereoMode::FrameSequence) {
-            // a pair of frames is shown when its second frame has come, so that both eyes are
-            // from the same moment
+        QQuickVideoStereoPresenter::Job retained;
+        if (resolved && packing.mode == StereoMode::FrameSequence && !multiview) {
             QMutexLocker lock(&m_frameMutex);
             if (repeated) {
-                submit = false;
-            } else if (m_stereoHeldFrame.isValid() && m_stereoHeldEye != eye) {
+                resolved = m_stereoPair && m_stereoPair->job.otherFrame.isValid();
+                if (resolved)
+                    retained = m_stereoPair->job;
+            } else if (m_stereoHeldFrame.isValid() && m_stereoHeldEye != (eye ^ int(st.swapEyes))) {
                 otherFrame = m_stereoHeldFrame;
-                m_stereoHeldFrame = QVideoFrame();
+                m_stereoHeldFrame = {};
+                m_stereoHeldEye = -1;
             } else {
-                // a pair starts with the frame of the eye that comes first, as the stream says, so
-                // that the two frames are those of one moment of the source
                 if (eye == (rightFirst ? 1 : 0) || m_stereoHeldFrame.isValid()) {
                     m_stereoHeldFrame = frame;
-                    m_stereoHeldEye = eye;
+                    m_stereoHeldEye = eye ^ int(st.swapEyes);
                 }
-                submit = false;
+                resolved = false;
             }
-        } else if (packing.mode != StereoMode::FrameSequence) {
+        } else if (packing.mode != StereoMode::FrameSequence || multiview) {
             QMutexLocker lock(&m_frameMutex);
-            m_stereoHeldFrame = QVideoFrame();
+            m_stereoHeldFrame = {};
+            m_stereoHeldEye = -1;
         }
-        if (result.layerActive) {
+        if (resolved) {
             QQuickVideoStereoPresenter::Job job;
-            job.frame = frame;
-            job.otherFrame = otherFrame;
+            job.frame = retained.frame.isValid() ? retained.frame : frame;
+            job.otherFrame = retained.frame.isValid() ? retained.otherFrame : otherFrame;
             job.packing = packing;
             job.swapEyes = st.swapEyes;
             job.scaling = st.scaling == StereoLanczos ? Scaling::Lanczos
@@ -1262,15 +1302,26 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
                     : depth <= 8 ? StereoSurface8Bit : depth <= 10 ? StereoSurface10Bit : StereoSurfaceHalfFloat;
             job.format = surface == StereoSurface8Bit ? BufferFormat::Xrgb8888
                     : surface == StereoSurface10Bit ? BufferFormat::Xrgb2101010
-                                                    : BufferFormat::Xbgr16161616f; // as deep as the compositor takes
+                                                    : BufferFormat::Xbgr16161616f;
             job.wide = depth > 12;
-            job.frameView = eye;
-            displaySize = viewSize(packing, frameSize);
-            if (submit) {
-                QMutexLocker lock(&m_frameMutex);
-                if (m_stereoPresenter)
-                    m_stereoPresenter->submit(std::move(job));
-            }
+            job.frameView = retained.frame.isValid()
+                    ? retained.frameView ^ int(retained.swapEyes != st.swapEyes) : eye;
+            job.displaySize = viewSize(packing, frameSize);
+            if (result.layerActive)
+                displaySize = job.displaySize;
+            QMutexLocker lock(&m_frameMutex);
+            job.sourceSerial = m_stereoSourceSerial;
+            if (!m_stereoPair)
+                m_stereoPair = std::make_unique<StereoPair>();
+            m_stereoPair->job = job;
+            if (result.layerActive && m_stereoPresenter)
+                m_stereoPresenter->submit(std::move(job));
+        }
+
+        if (!resolved) {
+            QMutexLocker lock(&m_frameMutex);
+            result.layerActive = result.layerActive && bool(m_stereoPair);
+            shownInLayer = result.layerActive;
         }
 #else
         Q_UNUSED(plain);
@@ -1330,6 +1381,18 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
         m_stereo.video = result.video;
         m_stereo.packing = result.packing;
         m_stereo.layerWanted = result.layerWanted;
+#ifdef QT_MM_STEREO_LAYER
+        if (!twoViews || (baseOnly && st.input == StereoNone)) {
+            if (m_stereoPresenter)
+                m_stereoPresenter->clear();
+            m_stereoPair.reset();
+            m_stereoHeldFrame = {};
+            m_stereoHeldEye = -1;
+            ++m_stereoSourceSerial;
+        } else if (!result.layerWanted && m_stereoPresenter) {
+            m_stereoPresenter->hide();
+        }
+#endif
         m_stereo.layerActive = result.layerActive;
         m_stereo.eyeRect = result.eyeRect;
         // only the frames of the video count, not a frame shown again

@@ -49,11 +49,11 @@ public:
     // wl_shm offers that is not deeper, else 8 bits
     QQuickVideoStereo::BufferFormat chooseFormat(QQuickVideoStereo::BufferFormat wanted) const;
 
-    // The rectangle of one view in the window's surface, in logical pixels
-    void setRect(const QRect &rect);
-
-    // Shows the two views, each as large as the image; both images have the same size
-    void present(const QImage &left, const QImage &right, QQuickVideoStereo::BufferFormat format);
+    // Shows the two native views at one view's rectangle in logical window pixels.
+    // The buffer and its destination are committed together. False means
+    // backpressure: retry the latest matching pair when buffers are released.
+    bool present(const QImage &left, const QImage &right, QQuickVideoStereo::BufferFormat format,
+                 const QRect &rect);
     // Takes the layer off the screen until the next present()
     void hide();
 

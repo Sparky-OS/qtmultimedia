@@ -8,6 +8,8 @@
 
 #include <QtCore/qmath.h>
 #include <QtCore/qfloat16.h>
+#include <QtQuick/qquickitem.h>
+#include <QtQuick/qquickwindow.h>
 
 #include <algorithm>
 #include <cmath>
@@ -396,6 +398,54 @@ QImage storedView(const QImage &frameImage, const Packing &packing, int index)
             std::copy_n(line + std::min(start + 2 * x, frameSize.width() - 1) * 4, 4, out + x * 4);
     }
     return view;
+}
+
+bool canCropLayer(const QQuickItem *item)
+{
+    if (!item)
+        return false;
+    const QPointF origin = item->mapToScene(QPointF());
+    const QPointF x = item->mapToScene(QPointF(1, 0)) - origin;
+    const QPointF y = item->mapToScene(QPointF(0, 1)) - origin;
+    // The layer follows a translated item; transforms and partial opacity need
+    // the scene graph. Output DPR is separate from these logical coordinates.
+    if (!qFuzzyCompare(x.x(), qreal(1)) || !qFuzzyIsNull(x.y())
+            || !qFuzzyIsNull(y.x()) || !qFuzzyCompare(y.y(), qreal(1)))
+        return false;
+    // wl_subsurface position and wp_viewport destination are whole logical
+    // pixels. Keep the item's hole identical to that placement; fractional
+    // placement uses the scene graph. DPR does not change this logical contract.
+    const QRectF placement = item->mapRectToScene(item->boundingRect());
+    if (placement.isEmpty() || placement != QRectF(placement.toRect()))
+        return false;
+    if (auto *window = item->window(); window
+            && !window->contentItem()->boundingRect().contains(placement))
+        return false;
+    for (auto *parent = item; parent; parent = parent->parentItem()) {
+        // Zero opacity is handled by the presenter visibility path, retaining a paused pair.
+        if (parent->opacity() > 0 && !qFuzzyCompare(parent->opacity(), qreal(1)))
+            return false;
+        if (parent->clip() && !parent->boundingRect().contains(parent->mapRectFromItem(item, item->boundingRect())))
+            return false;
+    }
+    return true;
+}
+
+QRect coverCrop(QSize samples, QSize display, QSize destination)
+{
+    if (samples.isEmpty() || display.isEmpty() || destination.isEmpty())
+        return {};
+    QSize kept = samples;
+    const double sourceAspect = double(display.width()) / display.height();
+    const double targetAspect = double(destination.width()) / destination.height();
+    if (sourceAspect > targetAspect)
+        kept.setWidth(std::clamp(qRound(samples.width() * targetAspect / sourceAspect), 1, samples.width()));
+    else
+        kept.setHeight(std::clamp(qRound(samples.height() * sourceAspect / targetAspect), 1, samples.height()));
+    // Keep the nearest number of complete samples, centered with the odd extra
+    // sample removed on the right/bottom. Never round each eye independently.
+    return QRect((samples.width() - kept.width()) / 2,
+                 (samples.height() - kept.height()) / 2, kept.width(), kept.height());
 }
 
 int bytesPerPixel(BufferFormat format)

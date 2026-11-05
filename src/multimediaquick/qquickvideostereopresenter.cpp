@@ -36,24 +36,31 @@ QQuickVideoStereoPresenter::~QQuickVideoStereoPresenter()
     wait();
 }
 
-void QQuickVideoStereoPresenter::setRect(const QRect &rect)
+void QQuickVideoStereoPresenter::setGeometry(Geometry geometry)
 {
-    if (m_valid)
-        m_layer->setRect(rect);
+    QMutexLocker lock(&m_mutex);
+    m_state.setGeometry(geometry);
+    m_condition.wakeAll();
 }
 
 void QQuickVideoStereoPresenter::hide()
 {
-    if (m_valid)
-        m_layer->hide();
+    QMutexLocker lock(&m_mutex);
+    m_state.hide();
+    m_condition.wakeAll();
+}
+
+void QQuickVideoStereoPresenter::clear()
+{
+    QMutexLocker lock(&m_mutex);
+    m_state.clear();
+    m_condition.wakeAll();
 }
 
 void QQuickVideoStereoPresenter::submit(Job job)
 {
     QMutexLocker lock(&m_mutex);
-    // only the newest frame is kept, when the video is faster than the conversion
-    m_pending = std::move(job);
-    m_hasPending = true;
+    m_state.submit(std::move(job));
     m_condition.wakeAll();
 }
 
@@ -67,24 +74,33 @@ void QQuickVideoStereoPresenter::run()
         m_condition.wakeAll();
     }
     while (m_valid) {
-        Job job;
+        State::Work work;
         {
             QMutexLocker lock(&m_mutex);
-            while (!m_hasPending && !m_stopping)
+            while (!m_state.dirty && !m_stopping)
                 m_condition.wait(&m_mutex);
+            // wl_buffer releases are dispatched by present(). Retry a paused
+            // update after backpressure without spinning or needing a new frame.
+            if (m_state.retry && !m_stopping)
+                m_condition.wait(&m_mutex, 16);
             if (m_stopping)
                 break;
-            job = std::move(m_pending);
-            m_pending = {};
-            m_hasPending = false;
+            work = m_state.take();
         }
-        process(job);
+        process(std::move(work));
     }
     m_layer.reset();
 }
 
-void QQuickVideoStereoPresenter::process(Job &job)
+void QQuickVideoStereoPresenter::process(State::Work work)
 {
+    if (!work.visible) {
+        QMutexLocker lock(&m_mutex);
+        if (m_state.isCurrent(work.revision))
+            m_layer->hide();
+        return;
+    }
+    Job &job = work.job;
     const QVideoFrameFormat format = job.frame.surfaceFormat();
     const bool rightFirst = job.packing.rightEyeFirst != job.swapEyes;
     const auto depth = job.wide ? QVideoFrameImageDepth::Float32 : QVideoFrameImageDepth::Float16;
@@ -113,9 +129,27 @@ void QQuickVideoStereoPresenter::process(Job &job)
     if (left.isNull() || right.isNull())
         return;
 
+    if (work.geometry.crop) {
+        const QRect crop = coverCrop(left.size(), job.displaySize, work.geometry.destination.size());
+        if (crop.isEmpty() || left.size() != right.size())
+            return;
+        if (crop != left.rect()) {
+            left = left.copy(crop);
+            right = right.copy(crop);
+        }
+    }
+
+    // Keep the revision check and the Wayland commit together. Conversion above
+    // may finish after a resize, hide or 3D-to-2D transition.
+    QMutexLocker lock(&m_mutex);
+    if (!m_state.isCurrent(work.revision))
+        return;
     const BufferFormat bufferFormat = m_layer->chooseFormat(job.format);
     m_layer->setColor({ format.colorSpace(), format.colorTransfer(), format.colorRange(), format.maxLuminance() });
-    m_layer->present(left, right, bufferFormat);
+    if (!m_layer->present(left, right, bufferFormat, work.geometry.destination)) {
+        m_state.retryPresentation(work.revision);
+        return;
+    }
 
     if (qLcStereoPresenter().isDebugEnabled()) {
         // the number of different levels of red in each view as the buffer holds them
@@ -125,7 +159,9 @@ void QQuickVideoStereoPresenter::process(Job &job)
             memcpy(&bits, &h, sizeof bits);
             return int(bits);
         };
-        auto levels = [bufferFormat, halfBits](const QImage &view) {
+        auto levels = [bufferFormat, halfBits](const QImage &image) {
+            const QImage view = image.format() == QImage::Format_RGBA32FPx4_Premultiplied
+                    ? image : image.convertToFormat(QImage::Format_RGBA32FPx4_Premultiplied);
             std::vector<bool> seen(65536, false);
             for (int y = 0; y < view.height(); ++y) {
                 const float *line = reinterpret_cast<const float *>(view.constScanLine(y));

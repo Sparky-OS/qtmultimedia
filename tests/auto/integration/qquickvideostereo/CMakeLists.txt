@@ -15,3 +15,13 @@ qt_internal_add_test(tst_qquickvideostereo
         Qt::Qml
         Qt::Quick
 )
+
+qt_internal_add_test(tst_qquickvideocrop
+    SOURCES tst_qquickvideocrop.cpp
+    LIBRARIES Qt::Gui Qt::MultimediaPrivate Qt::MultimediaQuickPrivate Qt::Quick
+)
+
+qt_internal_add_test(tst_qquickvideocroplayer
+    SOURCES tst_qquickvideocroplayer.cpp
+    LIBRARIES Qt::Gui Qt::MultimediaPrivate Qt::MultimediaQuickPrivate Qt::Quick
+)

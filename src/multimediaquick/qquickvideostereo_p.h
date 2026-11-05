@@ -16,11 +16,14 @@
 //
 
 #include <QtCore/qsize.h>
+#include <QtCore/qrect.h>
 #include <QtGui/qimage.h>
 #include <QtMultimedia/qvideoframeformat.h>
 #include <QtMultimediaQuick/private/qtmultimediaquickglobal_p.h>
 
 QT_BEGIN_NAMESPACE
+
+class QQuickItem;
 
 // Taking the two views of a stereoscopic 3D frame apart, in the packings of H.264 Table D-8,
 // H.265 Table D.8 and Matroska's StereoMode (RFC 9559, 5.1.4.1.28.3)
@@ -66,6 +69,11 @@ Q_MULTIMEDIAQUICK_EXPORT QImage extractView(const QImage &frame, const Packing &
 // surface hands the compositor, which resizes it once to the view's place. The image is any
 // RGBA float image or an 8 bit one; the result is RGBA32FPx4
 Q_MULTIMEDIAQUICK_EXPORT QImage storedView(const QImage &frame, const Packing &packing, int index);
+
+// The centered cover crop in stored samples, using one view's display shape. Both
+// eyes use these same half-open boundaries; rounding never interpolates a sample.
+Q_MULTIMEDIAQUICK_EXPORT QRect coverCrop(QSize samples, QSize display, QSize destination);
+Q_MULTIMEDIAQUICK_EXPORT bool canCropLayer(const QQuickItem *item);
 
 // Writes the pair left|right into memory as the given Wayland shm format, the layer's buffer:
 // 8 bits (XRGB8888), 10 bits (XRGB2101010), 16 bits (XBGR16161616) or half float (XBGR16161616F)

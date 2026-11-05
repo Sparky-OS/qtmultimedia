@@ -278,6 +278,7 @@ private:
         StereoInput packing = StereoNone;  // as the stream or the input says (never Automatic)
         bool layerWanted = false;          // shown through the layer, if there is one
         bool layerActive = false;
+        bool cropGeometrySupported = false;
         QRectF eyeRect = QRectF(0, 0, 1, 1); // the view in the frame, of the viewport, for the scene graph
         int sequence = 0;                  // frames of a frame sequence seen
         int lastView = -1;                 // the view the last frame of a sequence said it had
@@ -287,8 +288,11 @@ private:
     QVideoFrame m_stereoLastFrame;          // to show again when the choices change
     // The layer of the views, where the platform has one (QT_MM_STEREO_LAYER): kept in the class
     // whatever the build, so that every user of this header sees the same class
+    struct StereoPair;
+    std::unique_ptr<StereoPair> m_stereoPair; // survives temporary layer/window replacement
+    quint64 m_stereoSourceSerial = 0;
     QVideoFrame m_stereoHeldFrame;          // the first frame of a pair of a frame sequence
-    int m_stereoHeldEye = -1;
+    int m_stereoHeldEye = -1;               // physical eye, independent of input eye swap
     std::shared_ptr<QQuickVideoStereoPresenter> m_stereoPresenter;
     std::atomic_bool m_stereoPresenterReady = false;
     QTimer m_stereoTimer;
