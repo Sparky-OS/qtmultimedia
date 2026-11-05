@@ -1283,8 +1283,9 @@ void QQuickVideoOutput::setDepthGpuMemory(const QQuickVideoDepth::GpuMemory &mem
     How the frames of a video that carries depth travel while its views are drawn on the GPU: a map with \c frames (\c memory for
     a frame in system memory, \c imported for a decoder's hardware frame the passes read where it is, \c copied for one read back to
     system memory) and \c framesWhy (the reason for a copy), \c views (\c texture for views handed to the video sink as GPU
-    textures, \c readBack for views read back to system memory, \c memory for views drawn by the processor) and \c viewsWhy. Empty
-    when no views are drawn. \l stereoDepthReadBacks() counts the read backs.
+    textures, \c readBack for views read back to system memory, \c memory for views drawn by the processor) and \c viewsWhy, and
+    \c layer when the views are shown in the compositor's stereo layer, whose presenter takes them from system memory (\c views is then
+    \c readBack). Empty when no views are drawn. \l stereoDepthReadBacks() counts the read backs.
 */
 QVariantMap QQuickVideoOutput::stereoDepthRoute() const
 {
@@ -1862,7 +1863,6 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
     }
     setDepthChoice(depthChoice);
     setDepthGpuMemory(depthMemory);
-    setDepthRoute(depthRoute);
     const bool depthDrawn =
             depthInput != StereoNone && depthPictureRect.isNull() && st.view != StereoFlat;
     shown = input;
@@ -2094,6 +2094,20 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
         result.packing = StereoNone;
         result.sequence = 0;
     }
+
+    // Shown in the compositor's stereo layer, the views are not taken by the scene graph: the layer's presenter maps the frame (a read back
+    // to system memory when the views are textures), converts it to the buffer format it hands the compositor and copies it into shared
+    // memory. The route says so.
+    if (!depthRoute.isEmpty() && result.layerActive) {
+        depthRoute.insert(QStringLiteral("layer"), true);
+        if (depthRoute.value(QStringLiteral("views")).toString() == u"texture") {
+            depthRoute.insert(QStringLiteral("views"), QStringLiteral("readBack"));
+            depthRoute.insert(QStringLiteral("viewsWhy"),
+                              QStringLiteral("the compositor's stereo layer takes the views from system memory (its presenter converts them to the "
+                                             "buffer format of the output and copies them into shared memory buffers)"));
+        }
+    }
+    setDepthRoute(depthRoute);
 
     bool videoChanged = false;
     bool layerChanged = false;
