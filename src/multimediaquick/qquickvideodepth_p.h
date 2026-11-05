@@ -146,6 +146,9 @@ public:
     QString lastFrameRouteWhy() const;
     // The hardware frames this Renderer read back to system memory
     int hardwareReadBacks() const;
+    // The imported frames sampled for a picture (the first ones and every sixtieth), and how many of those samples were empty: a DMA-BUF
+    // another GPU accepted and read as zeros is refused and the frames are copied, which lastFrameRouteWhy() says
+    int importChecks(int *empty = nullptr) const;
 
     // The video sink the drawn views are shown by: when it draws with OpenGL the drawing context is made to share its textures (the
     // sink's RHI is the scene graph's, set from the thread that shows the frames)

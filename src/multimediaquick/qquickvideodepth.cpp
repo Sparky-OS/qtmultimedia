@@ -581,6 +581,21 @@ void main()
 }
 )";
 
+// A block of an imported frame's planes at the middle of the picture, as the bytes a check reads back: luma, and the two chroma samples
+const char kProbe[] = R"(
+uniform sampler2D u_y;
+uniform sampler2D u_uv;
+uniform ivec2 u_origin;
+uniform ivec2 u_size;
+out vec4 o_color;
+void main()
+{
+    ivec2 at = ivec2(gl_FragCoord.xy) + u_origin;
+    vec2 c = texelFetch(u_uv, clamp(at >> 1, ivec2(0), (u_size >> 1) - 1), 0).rg;
+    o_color = vec4(texelFetch(u_y, clamp(at, ivec2(0), u_size - 1), 0).r, c, 1.0);
+}
+)";
+
 // One channel of an RGBA picture as the depth map
 const char kChannel[] = R"(
 uniform sampler2D u_y;
@@ -888,6 +903,45 @@ public:
             *why = QStringLiteral("the planes have no OpenGL texture");
             return false;
         }
+        // The decoder's converter leaves the textures it made of the DMA-BUFs as they were created: a minification filter that needs mipmaps,
+        // which makes the texture incomplete and reads as zeros in a pass of ours (Qt's own sampler sets the filter when the scene graph draws
+        // them). The passes read level 0 at texel coordinates: the filters are set to nearest.
+        for (unsigned id : { unsigned(gy), unsigned(guv) }) {
+            m_f->glBindTexture(GL_TEXTURE_2D_, id);
+            m_f->glTexParameteri(GL_TEXTURE_2D_, 0x2801 /* MIN_FILTER */, 0x2600 /* NEAREST */);
+            m_f->glTexParameteri(GL_TEXTURE_2D_, 0x2800 /* MAG_FILTER */, 0x2600);
+            m_f->glTexParameteri(GL_TEXTURE_2D_, 0x2802 /* WRAP_S */, 0x812F /* CLAMP_TO_EDGE */);
+            m_f->glTexParameteri(GL_TEXTURE_2D_, 0x2803 /* WRAP_T */, 0x812F);
+        }
+        // A DMA-BUF the decoding GPU wrote can be accepted by another GPU and read back as zeros (the tiling or the synchronisation of the
+        // two devices does not agree). The planes of the first frames, and of every sixtieth, are sampled at the middle of the picture: a
+        // block of all-zero luma and chroma is no picture, so the import is refused, said, and the frames are copied from then on.
+        if (size != m_checkSize || bytes != m_checkBytes) {
+            m_checkSize = size;
+            m_checkBytes = bytes;
+            m_checked = m_emptyInRow = m_sinceCheck = 0;
+            m_importBad = false;
+        }
+        if (m_importBad) {
+            *why = QStringLiteral("the planes the decoder's frames were imported as were empty: this GPU cannot read the decoding GPU's DMA-BUF");
+            return false;
+        }
+        if (m_checked < 8 || ++m_sinceCheck >= 60) {
+            m_sinceCheck = 0;
+            const int found = sampleImported(unsigned(gy), unsigned(guv), size);
+            ++m_checked;
+            ++m_checksDone;
+            if (found == 1) {
+                ++m_checksEmpty;
+                if (++m_emptyInRow >= 4 || m_checked > 8) {
+                    m_importBad = true;
+                    *why = QStringLiteral("the planes the decoder's frames were imported as are empty: this GPU cannot read the decoding GPU's DMA-BUF");
+                    return false;
+                }
+            } else if (found == 0) {
+                m_emptyInRow = 0;
+            }
+        }
         m_imp.y = unsigned(gy);
         m_imp.uv = unsigned(guv);
         m_imp.textures = std::move(textures);
@@ -897,6 +951,34 @@ public:
         m_importBytes = bytes;
         return true;
     }
+
+    // Whether a block of 32x32 luma samples with their chroma, at the middle of the imported planes, is all zero: 1 for empty, 0 for a picture,
+    // -1 when the planes cannot be sampled
+    int sampleImported(unsigned y, unsigned uv, const QSize &size)
+    {
+        const int n = 32;
+        makeTexture(ProbeTex, n, n, GL_RGBA8_, GL_RGBA_);
+        m_f->glUseProgram(m_probe);
+        bindExternal(0, y, m_probe, "u_y");
+        bindExternal(1, uv, m_probe, "u_uv");
+        m_f->glUniform2i(m_f->glGetUniformLocation(m_probe, "u_origin"), std::max(0, (size.width() - n) / 2 & ~1), std::max(0, (size.height() - n) / 2 & ~1));
+        m_f->glUniform2i(m_f->glGetUniformLocation(m_probe, "u_size"), size.width(), size.height());
+        pass(m_probe, ProbeTex, n, n);
+        uchar block[32 * 32 * 4];
+        m_f->glPixelStorei(0x0D05 /* GL_PACK_ALIGNMENT */, 1);
+        m_f->glReadPixels(0, 0, n, n, GL_RGBA_, GL_UNSIGNED_BYTE_, block);
+        if (m_f->glGetError() != 0)
+            return -1;
+        int most[3] = {};
+        for (int i = 0; i < n * n; ++i)
+            for (int c = 0; c < 3; ++c)
+                most[c] = std::max<int>(most[c], block[4 * i + c]);
+        if (most[0] == 0 && most[1] == 0 && most[2] == 0)
+            return 1;
+        return 0;
+    }
+    int importChecks() const { return m_checksDone; }
+    int importEmpties() const { return m_checksEmpty; }
 
     // After the drawing: the frame's textures wait for the next one (the converter reuses them) and the frame is let go
     void releaseImport()
@@ -1020,7 +1102,7 @@ public:
     }
 
 private:
-    enum TexId { Y, U, V, Raw, Pic, Depth, Target, LayerPic, LayerDepth, OutY, OutU, OutV, NbTextures };
+    enum TexId { Y, U, V, Raw, Pic, Depth, Target, LayerPic, LayerDepth, OutY, OutU, OutV, ProbeTex, NbTextures };
     using Tex = GlTex;
 
     bool fail(const QString &why, QString *out)
@@ -1072,6 +1154,8 @@ private:
                 m_f->glDeleteProgram(m_luma);
             if (m_lumaInt)
                 m_f->glDeleteProgram(m_lumaInt);
+            if (m_probe)
+                m_f->glDeleteProgram(m_probe);
             m_imp = {};
             m_oldTextures.reset();
             m_rhi.reset();
@@ -1079,7 +1163,7 @@ private:
         }
         m_gl = nullptr;
         m_tex = {};
-        m_vao = m_fbo = m_convert = m_channel = m_encode = m_luma = m_lumaInt = 0;
+        m_vao = m_fbo = m_convert = m_channel = m_encode = m_luma = m_lumaInt = m_probe = 0;
         m_rhiFailed = false;
         m_shared = false;
         m_group = nullptr;
@@ -1139,14 +1223,15 @@ private:
         m_encode = program(kEncode);
         m_luma = program(kLuma);
         m_lumaInt = program(kLumaInt);
-        return m_convert && m_channel && m_encode && m_luma && m_lumaInt;
+        m_probe = program(kProbe);
+        return m_convert && m_channel && m_encode && m_luma && m_lumaInt && m_probe;
     }
 
     void makeTexture(TexId id, int w, int h, unsigned internal, unsigned format,
                      unsigned type = GL_UNSIGNED_BYTE_)
     {
         Tex &t = m_tex[id];
-        if (!t.id && (id == Target || id >= OutY)) {
+        if (!t.id && (id == Target || id == OutY || id == OutU || id == OutV)) {
             // a texture a frame handed out and gave back: the same size and format, drawn into again
             std::lock_guard<std::mutex> lock(m_poolMutex);
             for (auto it = m_pool.begin(); it != m_pool.end(); ++it) {
@@ -1511,7 +1596,13 @@ private:
     QString m_rhiWhy;
     Imported m_imp;
     QVideoFrameTexturesUPtr m_oldTextures;
-    unsigned m_luma = 0, m_lumaInt = 0;
+    unsigned m_luma = 0, m_lumaInt = 0, m_probe = 0;
+    // what the checks of imported planes found: the frame size and format they are for, the checks made, the empty ones in a row, and the verdict
+    QSize m_checkSize;
+    int m_checkBytes = 0;
+    int m_checked = 0, m_emptyInRow = 0, m_sinceCheck = 0;
+    bool m_importBad = false;
+    int m_checksDone = 0, m_checksEmpty = 0;
     uintptr_t m_importBase = 0;
     ptrdiff_t m_importStride = 0, m_importBytes = 1;
 };
@@ -2248,6 +2339,13 @@ int Renderer::hardwareReadBacks() const
     return d->hwReadBacks;
 }
 
+int Renderer::importChecks(int *empty) const
+{
+    if (empty)
+        *empty = d->gpu.importEmpties();
+    return d->gpu.importChecks();
+}
+
 void Renderer::setSinkRhi(QRhi *rhi)
 {
     d->sink = rhi;
@@ -2371,6 +2469,13 @@ QString Renderer::lastFrameRouteWhy() const
 
 int Renderer::hardwareReadBacks() const
 {
+    return 0;
+}
+
+int Renderer::importChecks(int *empty) const
+{
+    if (empty)
+        *empty = 0;
     return 0;
 }
 

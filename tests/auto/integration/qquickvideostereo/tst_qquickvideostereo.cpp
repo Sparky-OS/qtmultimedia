@@ -25,6 +25,7 @@
 #include <QtGui/qguiapplication.h>
 #include <QtGui/qtransform.h>
 #include <QtQuick/qquickwindow.h>
+#include <QtQuick/private/qquickwindow_p.h>
 
 #include <algorithm>
 #include <atomic>
@@ -95,11 +96,14 @@ private slots:
     void depthOnTheGpuKeepsTheDepth();
     void depthImportsHardwareFrames_data();
     void depthImportsHardwareFrames();
+    void depthRefusesEmptyImportedPlanes();
     void depthDeepCases_data();
     void depthDeepCases();
     void depthInVideoOutput();
     void depthViewsReachTheSinkAsTextures_data();
     void depthViewsReachTheSinkAsTextures();
+    void depthTextureFramesConvertLikeTheCopies_data();
+    void depthTextureFramesConvertLikeTheCopies();
     void depthRotated_data();
     void depthRotated();
     void depthRotatedFormats_data();
@@ -1064,8 +1068,8 @@ public:
             f->glTexImage2D(GL_TEXTURE_2D, 0, int(internal), w, h, 0, channels == 1 ? GL_RED : GL_RG,
                             deep ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE, data.data());
             f->glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-            f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            f->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            // The filters stay as they are created, as the VA-API converter leaves its textures: a minification filter that needs mipmaps
+            // (the texture is incomplete, and a pass that reads it by texel reads zeros) until the importing pass sets them
             m_ids[i] = id;
             const QRhiTexture::Format format = deep ? (channels == 1 ? QRhiTexture::R16 : QRhiTexture::RG16)
                                                     : (channels == 1 ? QRhiTexture::R8 : QRhiTexture::RG8);
@@ -1263,6 +1267,42 @@ void tst_QQuickVideoStereo::depthImportsHardwareFrames()
 // The cases of the depth captures at 10 and 16 bits (tools/qt/make-deep-cases.py makes the frames from the cases' pictures, DEEP_CASES is their
 // directory): the views the GPU draws against the C code's at the source's depth. The same criterion as the 8 bit cases, in 8 bit
 // equivalents of the codes: fewer than one pixel in 500 off by more than 2, a mean under 0.25
+// A DMA-BUF another GPU accepts and reads as zeros (the first import on the A10, before the filters were set): luma and chroma all zero is
+// no picture, so the frames are copied from then on and the reason is said; a frame with a picture is imported (the control, above)
+void tst_QQuickVideoStereo::depthRefusesEmptyImportedPlanes()
+{
+    if (!QQuickVideoDepth::canDraw())
+        QSKIP("built without libstereo-dibr");
+    QTemporaryDir cache;
+    qputenv("XDG_CACHE_HOME", cache.path().toLocal8Bit());
+    const int w = 128, h = 64;
+    std::vector<uchar> luma(size_t(2 * w) * h, 0), chroma(size_t(2 * w) * (h / 2), 0);
+    QVideoFrameFormat f(QSize(2 * w, h), QVideoFrameFormat::Format_NV12);
+    f.setStereoMode(Mode::DepthSideBySide);
+    FakeCounts counts;
+    auto hardware = [&] {
+        std::vector<FakeHardwareBuffer::Plane> planes;
+        planes.emplace_back(luma, 2 * w, 2 * w, h, 1);
+        planes.emplace_back(chroma, 2 * w, w, h / 2, 2);
+        return QVideoFramePrivate::createFrame(std::make_unique<FakeHardwareBuffer>(f, std::move(planes), false, &counts), f);
+    };
+    auto o = fixedWay();
+    o.gpu = true;
+    QQuickVideoDepth::Renderer renderer;
+    QVideoFrame drawn;
+    for (int i = 0; i < 6; ++i) {
+        const auto result = renderer.draw(hardware(), Mode::DepthSideBySide, false, {}, o, &drawn);
+        if (result != QQuickVideoDepth::Renderer::Result::Drawn || !renderer.lastOnGpu())
+            QSKIP("no OpenGL context in this environment");
+    }
+    QCOMPARE(renderer.lastFrameRoute(), QQuickVideoDepth::Renderer::FrameRoute::Copied);
+    QVERIFY2(renderer.lastFrameRouteWhy().contains(u"empty"_s), qPrintable(renderer.lastFrameRouteWhy()));
+    QVERIFY(renderer.hardwareReadBacks() >= 1);
+    int empty = 0;
+    QVERIFY(renderer.importChecks(&empty) >= 4);
+    QVERIFY(empty >= 4);
+}
+
 void tst_QQuickVideoStereo::depthDeepCases_data()
 {
     QTest::addColumn<QString>("raw");
@@ -1563,6 +1603,59 @@ void tst_QQuickVideoStereo::depthViewsReachTheSinkAsTextures()
             worst = std::max({ worst, std::abs(qRed(a) - qRed(b)), std::abs(qGreen(a) - qGreen(b)), std::abs(qBlue(a) - qBlue(b)) });
         }
     QVERIFY2(worst == 0, qPrintable(u"the texture route and the read back differ by %1 codes"_s.arg(worst)));
+}
+
+void tst_QQuickVideoStereo::depthTextureFramesConvertLikeTheCopies_data()
+{
+    depthViewsReachTheSinkAsTextures_data();
+}
+
+// A consumer that is not the sink (the stereo layer's presenter converts on a thread of its own, with a context of its own) gets from a frame of
+// textures what it gets from the frame the read back makes: the same image, whatever the depth of the source
+void tst_QQuickVideoStereo::depthTextureFramesConvertLikeTheCopies()
+{
+    if (!QQuickVideoDepth::canDraw())
+        QSKIP("built without libstereo-dibr");
+    if (qgetenv("QSG_RHI_BACKEND") != "opengl")
+        QSKIP("QSG_RHI_BACKEND=opengl is not set: the sink must draw with OpenGL");
+    QFETCH(int, format);
+    const auto pf = QVideoFrameFormat::PixelFormat(format);
+    QTemporaryDir cache;
+    qputenv("XDG_CACHE_HOME", cache.path().toLocal8Bit());
+    const int w = 128, h = 64;
+    QQuickWindow window;
+    window.resize(64, 64);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QRhi *rhi = nullptr;
+    QTRY_VERIFY((rhi = QQuickWindowPrivate::get(&window)->rhi) != nullptr);
+    QVERIFY(rhi->backend() == QRhi::OpenGLES2);
+    const QVideoFrame frame = pf == QVideoFrameFormat::Format_YUV444P ? depthFrame(Mode::DepthSideBySide, false, w, h)
+                                                                      : deepDepthFrame(pf, w, h);
+    auto drawn = [&](bool textures, QQuickVideoDepth::Renderer::ViewsRoute expected) {
+        QQuickVideoDepth::Renderer renderer;
+        renderer.setSinkRhi(rhi);
+        QQuickVideoDepth::Options o = fixedWay();
+        o.gpu = true;
+        o.viewsAsTexture = textures;
+        QVideoFrame out;
+        for (int i = 0; i < 2; ++i)
+            [&] { QCOMPARE(renderer.draw(frame, Mode::DepthSideBySide, false, {}, o, &out), QQuickVideoDepth::Renderer::Result::Drawn); }();
+        [&] { QVERIFY2(renderer.lastViewsRoute() == expected, qPrintable(renderer.lastViewsRouteWhy())); }();
+        // converted on a thread of its own, as the presenter does
+        QImage image;
+        std::thread([&] { image = qImageFromVideoFrame(out, QVideoFrameImageDepth::Float16); }).join();
+        return std::make_pair(image, renderer.viewsReadBacks());
+    };
+    const auto texture = drawn(true, QQuickVideoDepth::Renderer::ViewsRoute::Texture);
+    const auto copy = drawn(false, QQuickVideoDepth::Renderer::ViewsRoute::ReadBack);
+    QVERIFY(!texture.first.isNull());
+    QVERIFY(!copy.first.isNull());
+    QCOMPARE(texture.first.size(), copy.first.size());
+    QCOMPARE(texture.first.format(), copy.first.format());
+    // the consumer's mapping is a read back, and counted
+    QVERIFY(texture.second >= 1);
+    QCOMPARE(texture.first, copy.first);
 }
 
 namespace {

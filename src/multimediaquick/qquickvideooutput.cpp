@@ -1299,6 +1299,9 @@ QVariantMap QQuickVideoOutput::stereoDepthReadBacks() const
     if (m_depthRenderer) {
         map.insert(QStringLiteral("frames"), m_depthRenderer->hardwareReadBacks());
         map.insert(QStringLiteral("views"), m_depthRenderer->viewsReadBacks());
+        int empty = 0;
+        map.insert(QStringLiteral("importChecks"), m_depthRenderer->importChecks(&empty));
+        map.insert(QStringLiteral("importEmpty"), empty);
     }
     return map;
 }

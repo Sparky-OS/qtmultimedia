@@ -15,6 +15,7 @@ qt_internal_add_test(tst_qquickvideostereo
         Qt::MultimediaQuickPrivate
         Qt::Qml
         Qt::Quick
+        Qt::QuickPrivate
 )
 
 qt_internal_add_test(tst_qquickvideocrop
