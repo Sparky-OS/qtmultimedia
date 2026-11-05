@@ -3,7 +3,9 @@
 
 #include "qquickvideodepth_p.h"
 
+#include <QtMultimedia/private/qmultimediautils_p.h>
 #include <QtMultimedia/private/qvideoframeconverter_p.h>
+#include <QtMultimedia/private/qvideotransformation_p.h>
 #include <QtGui/qimage.h>
 
 #ifdef QT_MM_STEREO_DIBR
@@ -270,6 +272,99 @@ void fillPicture(stereo_dibr_picture *pic, std::vector<PlaneData> &planes, const
     }
 }
 
+// The samples of a plane as a frame's transformation turns them for display: rotated clockwise, then
+// mirrored horizontally (QVideoFrame::rotation() and mirrored(), as the scene graph applies them)
+struct TurnedPlane
+{
+    std::vector<uint8_t> data;
+    ptrdiff_t stride = 0;
+    int width = 0, height = 0; // in samples
+};
+
+template <typename Sample>
+void turnSamples(const uint8_t *src, ptrdiff_t stride, int w, int h, int rotation, bool mirrored,
+                 TurnedPlane *out)
+{
+    for (int y = 0; y < out->height; ++y) {
+        auto *dst = reinterpret_cast<Sample *>(out->data.data() + ptrdiff_t(y) * out->stride);
+        for (int x = 0; x < out->width; ++x) {
+            const int xr = mirrored ? out->width - 1 - x : x;
+            int sx = xr, sy = y;
+            switch (rotation) {
+            case 90:
+                sx = y;
+                sy = h - 1 - xr;
+                break;
+            case 180:
+                sx = w - 1 - xr;
+                sy = h - 1 - y;
+                break;
+            case 270:
+                sx = w - 1 - y;
+                sy = xr;
+                break;
+            default:
+                break;
+            }
+            dst[x] = *reinterpret_cast<const Sample *>(src + ptrdiff_t(sy) * stride
+                                                       + ptrdiff_t(sx) * sizeof(Sample));
+        }
+    }
+}
+
+TurnedPlane turnPlane(const void *src, ptrdiff_t stride, int bytes, int w, int h,
+                      const VideoTransformation &t)
+{
+    const int rotation = qToUnderlying(t.rotation);
+    TurnedPlane out;
+    out.width = rotation % 180 ? h : w;
+    out.height = rotation % 180 ? w : h;
+    out.stride = ptrdiff_t(out.width) * bytes;
+    out.data.resize(size_t(out.stride) * size_t(out.height));
+    const auto *bytesIn = static_cast<const uint8_t *>(src);
+    if (bytes == 2)
+        turnSamples<uint16_t>(bytesIn, stride, w, h, rotation, t.mirroredHorizontallyAfterRotation, &out);
+    else
+        turnSamples<uint8_t>(bytesIn, stride, w, h, rotation, t.mirroredHorizontallyAfterRotation, &out);
+    return out;
+}
+
+// A picture turned, every plane into storage kept in `keep` (a quarter turn swaps the subsampling
+// of the two axes with the axes)
+stereo_dibr_picture turnPicture(const stereo_dibr_picture &in, const VideoTransformation &t,
+                                std::vector<TurnedPlane> *keep)
+{
+    stereo_dibr_picture out = in;
+    const bool quarter = qToUnderlying(t.rotation) % 180 != 0;
+    out.width = quarter ? in.height : in.width;
+    out.height = quarter ? in.width : in.height;
+    for (int p = 0; p < in.nb_planes; ++p) {
+        const stereo_dibr_plane &pl = in.plane[p];
+        const int pw = (in.width + (1 << pl.log2_w) - 1) >> pl.log2_w;
+        const int ph = (in.height + (1 << pl.log2_h) - 1) >> pl.log2_h;
+        keep->push_back(turnPlane(pl.data, pl.stride, pl.bytes, pw, ph, t));
+        out.plane[p].data = keep->back().data.data();
+        out.plane[p].stride = keep->back().stride;
+        if (quarter) {
+            out.plane[p].log2_w = pl.log2_h;
+            out.plane[p].log2_h = pl.log2_w;
+        }
+    }
+    return out;
+}
+
+stereo_dibr_depth turnDepth(const stereo_dibr_depth &in, const VideoTransformation &t,
+                            std::vector<TurnedPlane> *keep)
+{
+    keep->push_back(turnPlane(in.data, in.stride, in.bytes, in.width, in.height, t));
+    stereo_dibr_depth out = in;
+    out.data = keep->back().data.data();
+    out.stride = keep->back().stride;
+    out.width = keep->back().width;
+    out.height = keep->back().height;
+    return out;
+}
+
 int packingOf(Mode mode)
 {
     switch (mode) {
@@ -356,7 +451,9 @@ Renderer::Result Renderer::draw(const QVideoFrame &input, Mode mode, bool depthF
     Layout l;
     if (!layoutOf(frame.pixelFormat(), &l)) {
         // packed YUV and the formats of hardware textures: drawn from their 8 bit RGBA image
-        const QImage image = qImageFromVideoFrame(frame, QVideoFrameImageDepth::Bits8);
+        // as stored: the transformation turns the parts below, not the packed frame
+        const QImage image =
+                qImageFromVideoFrame(frame, VideoTransformation{}, QVideoFrameImageDepth::Bits8);
         if (image.isNull())
             return Result::Failed;
         frame = QVideoFrame(image.convertToFormat(QImage::Format_RGBA8888));
@@ -391,6 +488,23 @@ Renderer::Result Renderer::draw(const QVideoFrame &input, Mode mode, bool depthF
         frame.unmap();
         return Result::Failed;
     }
+
+    // A video recorded sideways or upside down: the picture and its depth map are turned as the
+    // frame asks (its surface's and its own rotation and mirroring) before the views are drawn, so
+    // that the parallax runs along the width of the picture as it is shown and the drawn frame
+    // needs no transformation
+    const VideoTransformation transformation = qNormalizedFrameTransformation(input);
+    std::vector<TurnedPlane> turned;
+    turned.reserve(32);
+    if (transformation.rotation != QtVideo::Rotation::None
+        || transformation.mirroredHorizontallyAfterRotation) {
+        parts.picture = turnPicture(parts.picture, transformation, &turned);
+        depthParts.depth = turnDepth(depthParts.depth, transformation, &turned);
+        if (parts.layer.width) {
+            parts.layer = turnPicture(parts.layer, transformation, &turned);
+            depthParts.layer_depth = turnDepth(depthParts.layer_depth, transformation, &turned);
+        }
+    }
     const int vw = parts.picture.width, vh = parts.picture.height;
 
     stereo_depth_convention c;
@@ -413,6 +527,14 @@ Renderer::Result Renderer::draw(const QVideoFrame &input, Mode mode, bool depthF
     format.setStereoMode(Mode::SideBySide);
     format.setStereoFlags({});
     format.setStereoDepthMark({});
+    // drawn the right way up: nothing of the frame's transformation is left to apply
+    format.setRotation(QtVideo::Rotation::None);
+    format.setMirrored(false);
+    format.setScanLineDirection(QVideoFrameFormat::TopToBottom);
+    if (qToUnderlying(transformation.rotation) % 180 != 0) {
+        const QSize par = format.pixelAspectRatio();
+        format.setPixelAspectRatio(QSize(par.height(), par.width()));
+    }
     QVideoFrame result(format);
     if (!result.map(QVideoFrame::WriteOnly)) {
         frame.unmap();

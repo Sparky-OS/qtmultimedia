@@ -1714,7 +1714,8 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
             }
         }
 #endif
-        const auto transformation = qNormalizedFrameTransformation(frame, orientation);
+        // the frame shown: the views drawn from a depth map are drawn the right way up
+        const auto transformation = qNormalizedFrameTransformation(input, orientation);
         // The presenter crops both native views; frame rotation and mirroring still use the scene graph.
         const bool plain = transformation.rotation == QtVideo::Rotation::None
                 && !transformation.mirroredHorizontallyAfterRotation && !mirrored
