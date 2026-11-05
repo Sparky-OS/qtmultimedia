@@ -65,7 +65,8 @@ VideoRenderer::RenderingResult VideoRenderer::renderInternal(Frame frame)
 #endif
 
     const auto pixelAspectRatio = codecContext->pixelAspectRatio(frame.avFrame());
-    auto buffer = std::make_unique<QFFmpegVideoBuffer>(frame.takeAVFrame(), pixelAspectRatio, m_stereoMode);
+    auto buffer = std::make_unique<QFFmpegVideoBuffer>(frame.takeAVFrame(), pixelAspectRatio,
+                                                      m_stereoMode, m_sink->preserveNativeSize());
     QVideoFrameFormat format(buffer->size(), buffer->pixelFormat());
     format.setColorSpace(buffer->colorSpace());
     format.setColorTransfer(buffer->colorTransfer());

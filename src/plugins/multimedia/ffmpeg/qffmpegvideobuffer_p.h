@@ -45,7 +45,8 @@ public:
     // stereoMode is the packing the stream has had until this frame (the frame packing SEI comes
     // with keyframes only), for a frame that does not carry it
     QFFmpegVideoBuffer(AVFrameUPtr frame, AVRational pixelAspectRatio = { 1, 1 },
-                       QVideoFrameFormat::StereoMode stereoMode = QVideoFrameFormat::StereoMode::None);
+                       QVideoFrameFormat::StereoMode stereoMode = QVideoFrameFormat::StereoMode::None,
+                       bool preserveNativeSize = false);
     ~QFFmpegVideoBuffer() override;
 
     MapData map(QVideoFrame::MapMode mode) override;
@@ -76,8 +77,7 @@ public:
     // The frame's own packing of a stereoscopic 3D video, if it carries one
     std::optional<QFFmpeg::VideoStereo> stereo() const { return m_stereo; }
 
-    // The pixel aspect ratio left to the consumer: 1:1, but for a stereoscopic 3D frame with views
-    // side by side or on top of each other, which is kept at the size it is stored in
+    // The pixel aspect ratio left to the consumer when the stored raster is preserved.
     QSize pixelAspectRatio() const { return m_pixelAspectRatio; }
 
 private:

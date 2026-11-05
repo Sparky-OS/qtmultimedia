@@ -75,7 +75,8 @@ static std::optional<QFFmpeg::VideoStereo> stereoFromSideData(const AVFrame &fra
 }
 
 QFFmpegVideoBuffer::QFFmpegVideoBuffer(AVFrameUPtr frame, AVRational pixelAspectRatio,
-                                       QVideoFrameFormat::StereoMode stereoMode)
+                                       QVideoFrameFormat::StereoMode stereoMode,
+                                       bool preserveNativeSize)
     : QHwVideoBuffer(QVideoFrame::NoHandle),
       m_frame(frame.get()),
       m_size(qCalculateFrameSize({ frame->width, frame->height },
@@ -86,7 +87,7 @@ QFFmpegVideoBuffer::QFFmpegVideoBuffer(AVFrameUPtr frame, AVRational pixelAspect
     // pixels as one picture: the frame stays as it is stored, and the consumer, which takes the views
     // apart, restores each from the stored samples (QVideoFrameFormat::pixelAspectRatio)
     const auto mode = m_stereo ? m_stereo->mode : stereoMode;
-    if ((mode == QVideoFrameFormat::StereoMode::SideBySide
+    if ((preserveNativeSize || mode == QVideoFrameFormat::StereoMode::SideBySide
          || mode == QVideoFrameFormat::StereoMode::SideBySideQuincunx
          || mode == QVideoFrameFormat::StereoMode::TopBottom)
         && pixelAspectRatio.num > 0 && pixelAspectRatio.den > 0

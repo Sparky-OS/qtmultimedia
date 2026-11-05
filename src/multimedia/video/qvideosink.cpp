@@ -12,6 +12,7 @@
 #include <qpainter.h>
 #include <qmatrix4x4.h>
 #include <QDebug>
+#include <atomic>
 #include <private/qplatformmediaintegration_p.h>
 #include <private/qplatformvideosink_p.h>
 
@@ -49,6 +50,7 @@ public:
     QPlatformVideoSink *videoSink = nullptr;
     QObject *source = nullptr;
     QRhi *rhi = nullptr;
+    std::atomic_bool preserveNativeSize = false;
 };
 
 /*!
@@ -176,6 +178,33 @@ void QVideoSink::setSubtitleText(const QString &subtitle)
 QSize QVideoSink::videoSize() const
 {
     return d->videoSink ? d->videoSink->nativeSize() : QSize{};
+}
+
+/*!
+    \property QVideoSink::preserveNativeSize
+
+    Requests video frames at their stored raster size, with their source pixel
+    aspect ratio in QVideoFrameFormat::pixelAspectRatio(). The consumer is
+    responsible for applying that aspect ratio when presenting the frame.
+
+    The default is false, retaining the backend's usual aspect-ratio handling.
+    The FFmpeg backend supports this request for software and hardware frames.
+    Other backends may ignore it. Pixel format conversion may still be needed.
+    The request does not change the source's stereo metadata.
+
+    Set this property before starting playback. Changes affect subsequently
+    produced frames, not frames already delivered or queued.
+*/
+bool QVideoSink::preserveNativeSize() const
+{
+    return d->preserveNativeSize.load(std::memory_order_relaxed);
+}
+
+void QVideoSink::setPreserveNativeSize(bool preserve)
+{
+    if (d->preserveNativeSize.exchange(preserve, std::memory_order_relaxed) == preserve)
+        return;
+    emit preserveNativeSizeChanged(preserve);
 }
 
 void QVideoSink::setSource(QObject *source)

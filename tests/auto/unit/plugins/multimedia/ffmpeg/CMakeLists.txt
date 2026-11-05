@@ -4,3 +4,5 @@
 add_subdirectory(qffmpegmath)
 add_subdirectory(texturebridge)
 add_subdirectory(qffmpegvideoencoderutils)
+
+add_subdirectory(qffmpegvideobuffer)

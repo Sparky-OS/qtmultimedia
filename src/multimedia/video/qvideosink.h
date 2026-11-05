@@ -23,6 +23,8 @@ class Q_MULTIMEDIA_EXPORT QVideoSink : public QObject
     Q_OBJECT
     Q_PROPERTY(QString subtitleText READ subtitleText WRITE setSubtitleText NOTIFY subtitleTextChanged)
     Q_PROPERTY(QSize videoSize READ videoSize NOTIFY videoSizeChanged)
+    Q_PROPERTY(bool preserveNativeSize READ preserveNativeSize WRITE setPreserveNativeSize
+               NOTIFY preserveNativeSizeChanged)
 public:
     QVideoSink(QObject *parent = nullptr);
     ~QVideoSink() override;
@@ -31,6 +33,9 @@ public:
     void setRhi(QRhi *rhi);
 
     QSize videoSize() const;
+
+    bool preserveNativeSize() const;
+    void setPreserveNativeSize(bool preserve);
 
     QString subtitleText() const;
     void setSubtitleText(const QString &subtitle);
@@ -43,6 +48,7 @@ Q_SIGNALS:
     void videoFrameChanged(const QVideoFrame &frame) QT6_ONLY(const);
     void subtitleTextChanged(const QString &subtitleText) QT6_ONLY(const);
     void videoSizeChanged();
+    void preserveNativeSizeChanged(bool preserve);
 
 private:
     friend class QMediaPlayerPrivate;
