@@ -231,8 +231,8 @@ struct CudaFrameGeometry
     PerPlaneArray<CudaPlaneGeometry> planes{};
 };
 
-// NVDEC only ever decodes into semi-planar (2-plane, chroma-subsampled) formats - never
-// fully-planar ones - so this table only needs to cover that family.
+// NVDEC decodes 4:2:0 into semi-planar formats (2 planes, chroma-subsampled): 8 bit NV12, 10 bit P010, 12 bit P012 (a 12 bit sample in the high
+// bits of a 16 bit word), 16 bit P016. 4:4:4 comes as fully planar formats, which this table does not cover.
 std::optional<CudaFrameGeometry> cudaFrameGeometry(AVPixelFormat swFormat)
 {
     switch (swFormat) {
@@ -246,6 +246,7 @@ std::optional<CudaFrameGeometry> cudaFrameGeometry(AVPixelFormat swFormat)
             } },
         };
     case AV_PIX_FMT_P010:
+    case AV_PIX_FMT_P012:
     case AV_PIX_FMT_P016:
         return CudaFrameGeometry{
             2,
