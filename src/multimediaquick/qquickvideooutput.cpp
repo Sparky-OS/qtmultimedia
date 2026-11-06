@@ -1399,7 +1399,7 @@ bool QQuickVideoOutput::stereoLayerSupported()
 QQuickVideoOutput::StereoSurface QQuickVideoOutput::stereoSurfaceFor(StereoSurface chosen, int sourceDepth)
 {
     return chosen != StereoSurfaceBySource ? chosen
-            : sourceDepth <= 8 ? StereoSurface8Bit : sourceDepth <= 10 ? StereoSurface10Bit : StereoSurfaceHalfFloat;
+            : sourceDepth <= 8 ? StereoSurface8Bit : sourceDepth <= 10 ? StereoSurface10Bit : StereoSurface16Bit;
 }
 
 quint64 QQuickVideoOutput::stereoSourceSerial() const
