@@ -124,6 +124,9 @@ void feedbackDone(void *, zwp_linux_dmabuf_feedback_v1 *) { }
 void feedbackFormatTable(void *data, zwp_linux_dmabuf_feedback_v1 *, int32_t fd, uint32_t size)
 {
     auto *g = static_cast<Globals *>(data);
+    // a new set of feedback (the compositor sends one again when its devices or formats change) replaces the one before
+    g->dmabufEntries.clear();
+    g->trancheIndices.clear();
     void *table = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (table != MAP_FAILED) {
         g->dmabufTable = QByteArray(static_cast<const char *>(table), qsizetype(size));
@@ -537,6 +540,28 @@ bool configAttributes(BufferFormat format, bool es, EGLint *out, int capacity)
     }
     out[n] = EGL_NONE;
     return true;
+}
+
+// eglChooseConfig takes the sizes as minimums and puts the configs with more bits first (Mesa answers a request of 8.8.8 with a 10.10.10 config, and a
+// request of 10.10.10.2 with a 16.16.16.16 one): the config of exactly the depth asked for, so that the surface is the one the route says
+EGLConfig exactConfig(const EglApi &egl, EGLDisplay display, BufferFormat format, const EGLint *attributes)
+{
+    EGLConfig configs[128];
+    EGLint count = 0;
+    if (!egl.chooseConfig(display, attributes, configs, 128, &count) || count < 1)
+        return nullptr;
+    const EGLint bits = format == BufferFormat::Xrgb8888 ? 8 : format == BufferFormat::Xrgb2101010 ? 10 : 16;
+    const EGLint alpha = format == BufferFormat::Xrgb8888 ? 8 : format == BufferFormat::Xrgb2101010 ? 2 : 16;
+    for (EGLint i = 0; i < count; ++i) {
+        EGLint r = 0, g = 0, b = 0, a = 0;
+        egl.getConfigAttrib(display, configs[i], EGL_RED_SIZE, &r);
+        egl.getConfigAttrib(display, configs[i], EGL_GREEN_SIZE, &g);
+        egl.getConfigAttrib(display, configs[i], EGL_BLUE_SIZE, &b);
+        egl.getConfigAttrib(display, configs[i], EGL_ALPHA_SIZE, &a);
+        if (r == bits && g == bits && b == bits && (a == alpha || a == 0))
+            return configs[i];
+    }
+    return nullptr;
 }
 
 struct GpuSurface
@@ -1027,16 +1052,28 @@ bool QQuickVideoStereoLayer::Private::presentDmabuf(const QQuickVideoDepth::Laye
             EGLint number = 0;
             QList<uint64_t> fromDriver;
             QList<EGLBoolean> externalOnly;
-            if (ext.queryModifiers(t.display, EGLint(fourcc), 0, nullptr, nullptr, &number) && number > 0) {
+            const EGLBoolean counted = ext.queryModifiers(t.display, EGLint(fourcc), 0, nullptr, nullptr, &number);
+            const EGLint countError = counted ? EGL_SUCCESS : egl.getError();
+            if (counted && number > 0) {
                 fromDriver.resize(number);
                 externalOnly.resize(number);
                 if (!ext.queryModifiers(t.display, EGLint(fourcc), number, reinterpret_cast<EGLuint64KHR *>(fromDriver.data()), externalOnly.data(), &number))
                     number = 0;
             }
+            qCInfo(qLcStereoLayer) << "the driver's modifiers for" << fourccText(fourcc) << ": EGL says" << number << "(the query" << (counted ? "succeeded" : "failed")
+                                   << ", EGL error" << QString::number(countError, 16) << "); the compositor takes" << fromCompositor.size();
             QList<uint64_t> usable;
             for (EGLint i = 0; i < number; ++i) {
                 if (!externalOnly[i] && fromCompositor.contains(fromDriver[i]))
                     usable.append(fromDriver[i]);
+            }
+            // A driver without modifiers (Mesa's radeonsi before GFX9 lists none, whatever the format) shares its buffers with the layout it chooses
+            // (DRM_FORMAT_MOD_INVALID) or linear: both are the compositor's to list. The framebuffer check below tells whether it renders into them.
+            if (counted && number == 0) {
+                for (uint64_t implicitLayout : { modifierInvalid, uint64_t(0) /* DRM_FORMAT_MOD_LINEAR */ }) {
+                    if (fromCompositor.contains(implicitLayout))
+                        usable.append(implicitLayout);
+                }
             }
             if (usable.isEmpty()) {
                 notes << QStringLiteral("%1: the driver renders into %2 modifiers (%3 only for sampling), the compositor takes %4, none in common")
@@ -1603,9 +1640,8 @@ bool QQuickVideoStereoLayer::presentGpu(const QQuickVideoDepth::LayerSource &sou
                 lastWhy = QStringLiteral("EGL has no window surface of 16 bit unsigned normalised");
                 continue;
             }
-            EGLConfig config = nullptr;
-            EGLint count = 0;
-            if (!egl.chooseConfig(source.eglDisplay, attributes, &config, 1, &count) || count < 1) {
+            EGLConfig config = exactConfig(egl, source.eglDisplay, f, attributes);
+            if (!config) {
                 lastWhy = QStringLiteral("the driver has no window surface of this format (it has %1)").arg(windowFormatsOf(source.eglDisplay));
                 continue;
             }
