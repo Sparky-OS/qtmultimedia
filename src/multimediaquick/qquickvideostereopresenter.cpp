@@ -139,12 +139,24 @@ void QQuickVideoStereoPresenter::process(State::Work work)
                     return;
                 m_layer->setColor({ format.colorSpace(), format.colorTransfer(), format.colorRange(), format.maxLuminance() });
                 BufferFormat used = job.format;
-                if (m_layer->presentGpu(source, rightFirst, crop, job.format, work.geometry.destination, &used, &gpuWhy)) {
+                bool backpressure = false;
+                if (m_layer->presentGpu(source, rightFirst, crop, job.format, work.geometry.destination, &used, &gpuWhy, &backpressure)) {
+                    const auto path = m_layer->gpuPath();
                     QMutexLocker routeLock(&m_routeMutex);
                     ++m_route.gpuFrames;
                     m_route.gpuActive = true;
-                    m_route.dmabuf = m_layer->compositorHasDmabuf();
+                    m_route.dmabuf = path.offered;
+                    m_route.ownDmabufBuffers = path.buffersAttached;
+                    m_route.path = path.kind == QQuickVideoStereoLayer::GpuPathInfo::OwnDmabuf ? QStringLiteral("own DMA-BUF buffers")
+                                                                                              : QStringLiteral("window surface");
+                    m_route.pathDescription = path.description;
+                    m_route.surfaceFormat = used;
                     job.frame = {};
+                    return;
+                }
+                if (backpressure) {
+                    // the compositor holds every buffer of the layer: the same frame is shown when one is released (not copied another way)
+                    m_state.retryPresentation(work.revision);
                     return;
                 }
             }
@@ -159,6 +171,8 @@ void QQuickVideoStereoPresenter::process(State::Work work)
         m_route.why = gpuWhy;
         if (m_layer)
             m_route.dmabuf = m_layer->compositorHasDmabuf();
+        m_route.path = QStringLiteral("wl_shm");
+        m_route.pathDescription.clear();
     }
     QImage left, right;
     if (format.stereoFlags().testFlag(QVideoFrameFormat::StereoFlag::Multiview)) {
@@ -205,6 +219,10 @@ void QQuickVideoStereoPresenter::process(State::Work work)
     if (!m_layer->present(left, right, bufferFormat, work.geometry.destination)) {
         m_state.retryPresentation(work.revision);
         return;
+    }
+    {
+        QMutexLocker routeLock(&m_routeMutex);
+        m_route.surfaceFormat = bufferFormat;
     }
 
     if (qLcStereoPresenter().isDebugEnabled()) {

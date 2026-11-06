@@ -160,6 +160,10 @@ public:
         QString why;
         bool dmabuf = false;   // the compositor offers zwp_linux_dmabuf_v1
         bool gpuActive = false; // the last frame was drawn by the GPU
+        int ownDmabufBuffers = 0; // the frames committed with DMA-BUF buffers the layer allocated (observed by the layer)
+        QString path;             // "wl_shm", "window surface" or "own DMA-BUF buffers"
+        QString pathDescription;  // the format and modifier of the layer's own buffers
+        QQuickVideoStereo::BufferFormat surfaceFormat = QQuickVideoStereo::BufferFormat::Xrgb8888; // of the last GPU frame
     };
     LayerRoute layerRoute() const;
 

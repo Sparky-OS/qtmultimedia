@@ -246,7 +246,8 @@ public:
         StereoSurface8Bit,
         StereoSurface10Bit,
         StereoSurfaceHalfFloat, // or 16 bits, where the compositor has no half float
-        StereoSurfaceBySource   // 8 bits for 8 bit video, 10 bits for 10 bit video, half float or 16 bits above
+        StereoSurface16Bit,     // 16 bits per channel, unsigned normalised: the depth of 12 and 16 bit video
+        StereoSurfaceBySource   // 8 bits for 8 bit video, 10 bits for 10 bit video, 16 bits above
     };
     Q_ENUM(StereoSurface)
 

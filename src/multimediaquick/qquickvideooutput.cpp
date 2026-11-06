@@ -731,9 +731,11 @@ void QQuickVideoOutput::setStereoScaling(StereoScaling scaling)
     \value StereoSurface10Bit 10 bits per channel (the compositor takes it or the surface stays at
            8).
     \value StereoSurfaceHalfFloat Half float, or 16 bits per channel where the compositor has no
-           half float.
+           half float (half float holds about 11 significant bits).
+    \value StereoSurface16Bit 16 bits per channel, unsigned normalised, or half float where the compositor
+           has no such format.
     \value StereoSurfaceBySource The depth of the video: 8 bits for 8 bit video, 10 bits for
-           10 bit video, half float above.
+           10 bit video, 16 bits above (12 bit video included: half float is not lossless at 12 bits).
 
     The default value is \c StereoSurfaceBySource.
 */
@@ -1928,8 +1930,8 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
 #ifdef QT_MM_STEREO_LAYER
         if (!repeated) {
             QMutexLocker lock(&m_frameMutex);
-            // the format and the packing of the frame shown before, as they were compared then: for a depth video the frame kept to show again is the
-            // stored one (the picture with its depth map) and the frame shown the drawn views, so the stored one is no measure of what changed
+            // the format of the frame shown before, as it was compared then: for a depth video the frame kept to show again is the stored one
+            // (the picture with its depth map) and the frame shown the drawn views, so the stored one is no measure of what changed
             auto previous = m_stereoLastShownFormat;
             auto incoming = format;
             previous.setStereoView(QVideoFrameFormat::StereoView::Packed);
@@ -2022,11 +2024,13 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
                     : st.scaling == StereoBicubic ? Scaling::Bicubic : Scaling::Bilinear;
             const int depth = sourceDepth(format.pixelFormat());
             const StereoSurface surface = st.surface != StereoSurfaceBySource ? st.surface
-                    : depth <= 8 ? StereoSurface8Bit : depth <= 10 ? StereoSurface10Bit : StereoSurfaceHalfFloat;
+                    : depth <= 8 ? StereoSurface8Bit : depth <= 10 ? StereoSurface10Bit : StereoSurface16Bit;
             job.format = surface == StereoSurface8Bit ? BufferFormat::Xrgb8888
                     : surface == StereoSurface10Bit ? BufferFormat::Xrgb2101010
+                    : surface == StereoSurface16Bit ? BufferFormat::Xbgr16161616
                                                     : BufferFormat::Xbgr16161616f;
-            job.wide = depth > 12;
+            // half float images hold 11 significant bits: 12 bit content and deeper is converted at 32 bit floating point
+            job.wide = depth > 10;
             job.frameView = retained.frame.isValid()
                     ? retained.frameView ^ int(retained.swapEyes != st.swapEyes) : eye;
             job.displaySize = viewSize(packing, frameSize);
@@ -2120,11 +2124,28 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
                 layerRoute = m_stereoPresenter->layerRoute();
         }
         depthRoute.insert(QStringLiteral("layer"), true);
-        depthRoute.insert(QStringLiteral("layerDmabuf"), layerRoute.dmabuf);
+        // layerDmabuf is what was observed: frames committed with DMA-BUF buffers the layer allocated and handed over itself. What the compositor
+        // offers is layerDmabufOffered. The buffers of a driver's window surface are the driver's to exchange (observed in the protocol, by the
+        // proofs, not by the layer): layerPath says which route the views took.
+        depthRoute.insert(QStringLiteral("layerDmabuf"), layerRoute.ownDmabufBuffers > 0);
+        depthRoute.insert(QStringLiteral("layerDmabufFrames"), layerRoute.ownDmabufBuffers);
+        depthRoute.insert(QStringLiteral("layerDmabufOffered"), layerRoute.dmabuf);
+        depthRoute.insert(QStringLiteral("layerPath"), layerRoute.path);
+        if (!layerRoute.pathDescription.isEmpty())
+            depthRoute.insert(QStringLiteral("layerBuffer"), layerRoute.pathDescription);
+        {
+            const char *names[] = { "XRGB8888", "XRGB2101010", "XBGR16161616", "XBGR16161616F" };
+            const int index = layerRoute.surfaceFormat == QQuickVideoStereo::BufferFormat::Xrgb8888 ? 0
+                    : layerRoute.surfaceFormat == QQuickVideoStereo::BufferFormat::Xrgb2101010 ? 1
+                    : layerRoute.surfaceFormat == QQuickVideoStereo::BufferFormat::Xbgr16161616 ? 2 : 3;
+            depthRoute.insert(QStringLiteral("layerSurfaceFormat"), QLatin1String(names[index]));
+        }
         if (layerRoute.gpuActive) {
             depthRoute.insert(QStringLiteral("views"), QStringLiteral("texture"));
             depthRoute.insert(QStringLiteral("viewsWhy"),
-                              QStringLiteral("the stereo layer draws the views into a window surface of the GPU (no read back, no copy of ours)"));
+                              layerRoute.path == u"own DMA-BUF buffers"
+                                      ? QStringLiteral("the stereo layer draws the views into DMA-BUF buffers it allocated (GBM) and gives them to the compositor (no read back, no copy of ours)")
+                                      : QStringLiteral("the stereo layer draws the views into a window surface of the GPU (no read back, no copy of ours)"));
         } else if (depthRoute.value(QStringLiteral("views")).toString() == u"texture") {
             depthRoute.insert(QStringLiteral("views"), QStringLiteral("readBack"));
             depthRoute.insert(QStringLiteral("viewsWhy"),

@@ -79,7 +79,8 @@ if(NOT QT_NO_STEREO_LAYER AND WAYLAND_CLIENT_FOUND AND WAYLAND_PROTOCOLS_FOUND A
     pkg_get_variable(WAYLAND_SCANNER wayland-scanner wayland_scanner)
     set(stereo_layer_protocols
         "stable/viewporter/viewporter.xml:viewporter"
-        "staging/color-management/color-management-v1.xml:color-management-v1")
+        "staging/color-management/color-management-v1.xml:color-management-v1"
+        "stable/linux-dmabuf/linux-dmabuf-v1.xml:linux-dmabuf-v1")
     set(stereo_layer_sources)
     set(stereo_layer_headers)
     foreach(entry IN LISTS stereo_layer_protocols)

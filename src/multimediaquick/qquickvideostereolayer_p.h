@@ -60,11 +60,24 @@ public:
     // take them), and draws the two eyes into it with one pass at the texture's depth. crop is the part of one eye shown, in the eye's pixels.
     // False with the reason in why: the caller then shows the views through present(), which leaves the window surface. *used is the format of
     // the surface: the one asked for where the driver has a surface of it, else the next one down (said in the log).
+    // *backpressure is set when the compositor holds every buffer of the layer's own (false with no reason to show the views another way:
+    // the frame is retried when a buffer is released)
     bool presentGpu(const QQuickVideoDepth::LayerSource &source, bool swapEyes, const QRect &crop,
                     QQuickVideoStereo::BufferFormat format, const QRect &rect,
-                    QQuickVideoStereo::BufferFormat *used, QString *why);
-    // Whether the last view was shown through a window surface of the GPU
+                    QQuickVideoStereo::BufferFormat *used, QString *why, bool *backpressure = nullptr);
+    // Whether the last view was drawn by the GPU (a window surface of the driver, or buffers of the layer's own)
     bool gpuActive() const;
+    // How the GPU's views reach the compositor. WindowSurface: the driver's window surface (the driver exchanges its buffers with the
+    // compositor, as DMA-BUF where both take them: seen in the protocol, not here). OwnDmabuf: buffers the layer allocated (GBM) and gave
+    // through zwp_linux_dmabuf_v1: buffersAttached counts the frames committed with them (observed here).
+    struct GpuPathInfo
+    {
+        enum Kind { None, WindowSurface, OwnDmabuf } kind = None;
+        bool offered = false; // the compositor offers zwp_linux_dmabuf_v1
+        int buffersAttached = 0;
+        QString description;
+    };
+    GpuPathInfo gpuPath() const;
     // Whether the compositor offers zwp_linux_dmabuf_v1
     bool compositorHasDmabuf() const;
     // Takes the layer off the screen until the next present()
