@@ -586,13 +586,16 @@ void main()
 const char kProbe[] = R"(
 uniform sampler2D u_y;
 uniform sampler2D u_uv;
+uniform sampler2D u_v;
+uniform int u_planar;
 uniform ivec2 u_origin;
 uniform ivec2 u_size;
 out vec4 o_color;
 void main()
 {
     ivec2 at = ivec2(gl_FragCoord.xy) + u_origin;
-    vec2 c = texelFetch(u_uv, clamp(at >> 1, ivec2(0), (u_size >> 1) - 1), 0).rg;
+    ivec2 cc = clamp(u_planar != 0 ? at : at >> 1, ivec2(0), (u_planar != 0 ? u_size : u_size >> 1) - 1);
+    vec2 c = u_planar != 0 ? vec2(texelFetch(u_uv, cc, 0).r, texelFetch(u_v, cc, 0).r) : texelFetch(u_uv, cc, 0).rg;
     o_color = vec4(texelFetch(u_y, clamp(at, ivec2(0), u_size - 1), 0).r, c, 1.0);
 }
 )";
@@ -658,7 +661,8 @@ public:
     struct Imported
     {
         bool on = false;
-        unsigned y = 0, uv = 0;
+        unsigned y = 0, uv = 0, v = 0; // v is the third plane of a fully planar frame (uv is then the second)
+        bool planar = false;
         QVideoFrameTexturesUPtr textures;
     };
 
@@ -882,7 +886,7 @@ public:
 
     // Whether a frame is one the decoder keeps on a GPU, and when it is (and the person did not ask for a copy), its planes as
     // textures of this context. *hardware: the frame is a hardware frame (its read back is a copy to system memory).
-    bool importFrame(QHwVideoBuffer *hw, const QSize &size, int bytes, bool copyAsked, bool *hardware, QString *why)
+    bool importFrame(QHwVideoBuffer *hw, const QSize &size, int bytes, bool copyAsked, bool planar, bool *hardware, QString *why)
     {
         *hardware = false;
         m_imp = {};
@@ -903,19 +907,21 @@ public:
                                   "imported by this GPU)");
             return false;
         }
-        QRhiTexture *ty = textures->texture(0), *tuv = textures->texture(1);
-        if (!ty || !tuv) {
-            *why = QStringLiteral("the frame has no two planes (luma and interleaved chroma)");
+        QRhiTexture *ty = textures->texture(0), *tuv = textures->texture(1), *tv = planar ? textures->texture(2) : nullptr;
+        if (!ty || !tuv || (planar && !tv)) {
+            *why = planar ? QStringLiteral("the frame has no three planes (luma and two chroma)")
+                          : QStringLiteral("the frame has no two planes (luma and interleaved chroma)");
             return false;
         }
         const QRhiTexture::Format fy = bytes == 2 ? QRhiTexture::R16 : QRhiTexture::R8;
-        const QRhiTexture::Format fuv = bytes == 2 ? QRhiTexture::RG16 : QRhiTexture::RG8;
-        if (ty->format() != fy || tuv->format() != fuv) {
+        const QRhiTexture::Format fuv = planar ? fy : bytes == 2 ? QRhiTexture::RG16 : QRhiTexture::RG8;
+        if (ty->format() != fy || tuv->format() != fuv || (tv && tv->format() != fy)
+            || (planar && (tuv->pixelSize() != size || tv->pixelSize() != size))) {
             *why = QStringLiteral("the planes are textures of a format the passes do not read (%1, %2)")
                            .arg(int(ty->format())).arg(int(tuv->format()));
             return false;
         }
-        if ((ty->flags() & QRhiTexture::ExternalOES) || (tuv->flags() & QRhiTexture::ExternalOES)) {
+        if ((ty->flags() & QRhiTexture::ExternalOES) || (tuv->flags() & QRhiTexture::ExternalOES) || (tv && (tv->flags() & QRhiTexture::ExternalOES))) {
             *why = QStringLiteral("the planes are external (OES) textures");
             return false;
         }
@@ -924,15 +930,17 @@ public:
                            .arg(ty->pixelSize().height()).arg(size.width()).arg(size.height());
             return false;
         }
-        const quint64 gy = ty->nativeTexture().object, guv = tuv->nativeTexture().object;
-        if (!gy || !guv) {
+        const quint64 gy = ty->nativeTexture().object, guv = tuv->nativeTexture().object, gv = tv ? tv->nativeTexture().object : 0;
+        if (!gy || !guv || (planar && !gv)) {
             *why = QStringLiteral("the planes have no OpenGL texture");
             return false;
         }
         // The decoder's converter leaves the textures it made of the DMA-BUFs as they were created: a minification filter that needs mipmaps,
         // which makes the texture incomplete and reads as zeros in a pass of ours (Qt's own sampler sets the filter when the scene graph draws
         // them). The passes read level 0 at texel coordinates: the filters are set to nearest.
-        for (unsigned id : { unsigned(gy), unsigned(guv) }) {
+        for (unsigned id : { unsigned(gy), unsigned(guv), unsigned(gv) }) {
+            if (!id)
+                continue;
             m_f->glBindTexture(GL_TEXTURE_2D_, id);
             m_f->glTexParameteri(GL_TEXTURE_2D_, 0x2801 /* MIN_FILTER */, 0x2600 /* NEAREST */);
             m_f->glTexParameteri(GL_TEXTURE_2D_, 0x2800 /* MAG_FILTER */, 0x2600);
@@ -954,7 +962,7 @@ public:
         }
         if (m_checked < 8 || ++m_sinceCheck >= 60) {
             m_sinceCheck = 0;
-            const int found = sampleImported(unsigned(gy), unsigned(guv), size);
+            const int found = sampleImported(unsigned(gy), unsigned(guv), unsigned(gv), size);
             ++m_checked;
             ++m_checksDone;
             if (found == 1) {
@@ -970,6 +978,8 @@ public:
         }
         m_imp.y = unsigned(gy);
         m_imp.uv = unsigned(guv);
+        m_imp.v = unsigned(gv);
+        m_imp.planar = planar;
         m_imp.textures = std::move(textures);
         m_imp.on = true;
         m_importBase = kImportedBase;
@@ -980,13 +990,15 @@ public:
 
     // Whether a block of 32x32 luma samples with their chroma, at the middle of the imported planes, is all zero: 1 for empty, 0 for a picture,
     // -1 when the planes cannot be sampled
-    int sampleImported(unsigned y, unsigned uv, const QSize &size)
+    int sampleImported(unsigned y, unsigned uv, unsigned v, const QSize &size)
     {
         const int n = 32;
         makeTexture(ProbeTex, n, n, GL_RGBA8_, GL_RGBA_);
         m_f->glUseProgram(m_probe);
         bindExternal(0, y, m_probe, "u_y");
         bindExternal(1, uv, m_probe, "u_uv");
+        bindExternal(2, v ? v : uv, m_probe, "u_v");
+        m_f->glUniform1i(m_f->glGetUniformLocation(m_probe, "u_planar"), v ? 1 : 0);
         m_f->glUniform2i(m_f->glGetUniformLocation(m_probe, "u_origin"), std::max(0, (size.width() - n) / 2 & ~1), std::max(0, (size.height() - n) / 2 & ~1));
         m_f->glUniform2i(m_f->glGetUniformLocation(m_probe, "u_size"), size.width(), size.height());
         pass(m_probe, ProbeTex, n, n);
@@ -1535,7 +1547,7 @@ private:
         if (m_imp.on) {
             bindExternal(0, m_imp.y, m_convert, "u_y");
             bindExternal(1, m_imp.uv, m_convert, "u_u");
-            bindExternal(2, m_imp.uv, m_convert, "u_v");
+            bindExternal(2, m_imp.planar ? m_imp.v : m_imp.uv, m_convert, "u_v");
         } else {
             bindTexture(0, Y, m_convert, "u_y");
             bindTexture(1, U, m_convert, "u_u");
@@ -2043,18 +2055,20 @@ Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, M
             if (turn.rotation != QtVideo::Rotation::None || turn.mirroredHorizontallyAfterRotation) {
                 // the pictures of a turned frame are turned on the processor's copy
                 bool dummy = false;
-                gpu.run([&] { ok = gpu.makeCurrent() && gpu.importFrame(hw, QSize(), 1, true, &dummy, &reason); gpu.doneCurrent(); });
+                gpu.run([&] { ok = gpu.makeCurrent() && gpu.importFrame(hw, QSize(), 1, true, false, &dummy, &reason); gpu.doneCurrent(); });
                 hardware = dummy;
                 reason = QStringLiteral("the frame is turned (rotated or mirrored)");
-            } else if (!l.semiPlanar || source != GpuDrawer::Source::SemiUV) {
+            } else if (!(l.semiPlanar && source == GpuDrawer::Source::SemiUV) && !(!l.semiPlanar && source == GpuDrawer::Source::Planar && l.count == 3)) {
                 bool dummy = false;
-                gpu.run([&] { ok = gpu.makeCurrent() && gpu.importFrame(hw, QSize(), 1, true, &dummy, &reason); gpu.doneCurrent(); });
+                gpu.run([&] { ok = gpu.makeCurrent() && gpu.importFrame(hw, QSize(), 1, true, false, &dummy, &reason); gpu.doneCurrent(); });
                 hardware = dummy;
-                reason = QStringLiteral("the frame's planes are not luma and interleaved chroma");
+                reason = QStringLiteral("the frame's planes are neither luma with interleaved chroma nor three planes");
             } else {
+                // luma and interleaved chroma (NV12, P010, P016), or three planes (YUV444P, YUV444P16)
+                const bool planarFrame = source == GpuDrawer::Source::Planar;
                 gpu.run([&] {
                     ok = gpu.makeCurrent()
-                            && gpu.importFrame(hw, frame.size(), l.bytes, !options.importFrames, &hardware, &reason);
+                            && gpu.importFrame(hw, frame.size(), l.bytes, !options.importFrames, planarFrame, &hardware, &reason);
                     gpu.doneCurrent();
                 });
             }

@@ -232,7 +232,7 @@ struct CudaFrameGeometry
 };
 
 // NVDEC decodes 4:2:0 into semi-planar formats (2 planes, chroma-subsampled): 8 bit NV12, 10 bit P010, 12 bit P012 (a 12 bit sample in the high
-// bits of a 16 bit word), 16 bit P016. 4:4:4 comes as fully planar formats, which this table does not cover.
+// bits of a 16 bit word), 16 bit P016. 4:4:4 comes as the fully planar YUV444P, YUV444P16 and (FFmpeg 8 and later) YUV444P10MSB and YUV444P12MSB.
 std::optional<CudaFrameGeometry> cudaFrameGeometry(AVPixelFormat swFormat)
 {
     switch (swFormat) {
@@ -253,6 +253,30 @@ std::optional<CudaFrameGeometry> cudaFrameGeometry(AVPixelFormat swFormat)
             { {
                     CudaPlaneGeometry{ 2, 1, 1, 1 },
                     CudaPlaneGeometry{ 2, 2, 2, 2 },
+            } },
+        };
+    // 4:4:4 comes fully planar: three planes of the frame's size, 8 bit or 16 bit words (10 and 12 bit samples in the 16 bit words)
+    case AV_PIX_FMT_YUV444P:
+        return CudaFrameGeometry{
+            3,
+            { {
+                    CudaPlaneGeometry{ 1, 1, 1, 1 },
+                    CudaPlaneGeometry{ 1, 1, 1, 1 },
+                    CudaPlaneGeometry{ 1, 1, 1, 1 },
+            } },
+        };
+    case AV_PIX_FMT_YUV444P16:
+#ifdef AV_PIX_FMT_YUV444P10MSB
+    // FFmpeg 8 and later: NVDEC's 10 and 12 bit 4:4:4 as 16 bit words with the sample in the most significant bits (the same scale as YUV444P16)
+    case AV_PIX_FMT_YUV444P10MSB:
+    case AV_PIX_FMT_YUV444P12MSB:
+#endif
+        return CudaFrameGeometry{
+            3,
+            { {
+                    CudaPlaneGeometry{ 2, 1, 1, 1 },
+                    CudaPlaneGeometry{ 2, 1, 1, 1 },
+                    CudaPlaneGeometry{ 2, 1, 1, 1 },
             } },
         };
     default:
