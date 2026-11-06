@@ -1303,6 +1303,16 @@ QVariantMap QQuickVideoOutput::stereoDepthReadBacks() const
         int empty = 0;
         map.insert(QStringLiteral("importChecks"), m_depthRenderer->importChecks(&empty));
         map.insert(QStringLiteral("importEmpty"), empty);
+#ifdef QT_MM_STEREO_LAYER
+        {
+            QMutexLocker frameLock(&m_frameMutex);
+            if (m_stereoPresenter) {
+                const auto route = m_stereoPresenter->layerRoute();
+                map.insert(QStringLiteral("layerGpuFrames"), route.gpuFrames);
+                map.insert(QStringLiteral("layerCopiedFrames"), route.copiedFrames);
+            }
+        }
+#endif
     }
     return map;
 }
@@ -2095,18 +2105,32 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
         result.sequence = 0;
     }
 
-    // Shown in the compositor's stereo layer, the views are not taken by the scene graph: the layer's presenter maps the frame (a read back
-    // to system memory when the views are textures), converts it to the buffer format it hands the compositor and copies it into shared
-    // memory. The route says so.
+    // Shown in the compositor's stereo layer, the views are not taken by the scene graph: the layer's presenter draws them into a window surface of the
+    // GPU (no read back), or maps the frame (a read back to system memory when the views are textures), converts it to the buffer format it hands
+    // the compositor and copies it into shared memory. The route says which, and why.
+#ifdef QT_MM_STEREO_LAYER
     if (!depthRoute.isEmpty() && result.layerActive) {
+        QQuickVideoStereoPresenter::LayerRoute layerRoute;
+        {
+            QMutexLocker lock(&m_frameMutex);
+            if (m_stereoPresenter)
+                layerRoute = m_stereoPresenter->layerRoute();
+        }
         depthRoute.insert(QStringLiteral("layer"), true);
-        if (depthRoute.value(QStringLiteral("views")).toString() == u"texture") {
+        depthRoute.insert(QStringLiteral("layerDmabuf"), layerRoute.dmabuf);
+        if (layerRoute.gpuActive) {
+            depthRoute.insert(QStringLiteral("views"), QStringLiteral("texture"));
+            depthRoute.insert(QStringLiteral("viewsWhy"),
+                              QStringLiteral("the stereo layer draws the views into a window surface of the GPU (no read back, no copy of ours)"));
+        } else if (depthRoute.value(QStringLiteral("views")).toString() == u"texture") {
             depthRoute.insert(QStringLiteral("views"), QStringLiteral("readBack"));
             depthRoute.insert(QStringLiteral("viewsWhy"),
-                              QStringLiteral("the compositor's stereo layer takes the views from system memory (its presenter converts them to the "
-                                             "buffer format of the output and copies them into shared memory buffers)"));
+                              layerRoute.copiedFrames || !layerRoute.why.isEmpty()
+                                      ? QStringLiteral("the stereo layer takes the views from system memory: %1").arg(layerRoute.why)
+                                      : QStringLiteral("the stereo layer takes the views from system memory (no frame has reached it yet)"));
         }
     }
+#endif
     setDepthRoute(depthRoute);
 
     bool videoChanged = false;

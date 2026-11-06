@@ -914,6 +914,10 @@ void tst_QQuickVideoStereo::depthOnTheGpuKeepsTheDepth_data()
     QTest::newRow("YUV 4:2:0 10 bit, BT.601, full") << int(yuv) << 10 << 0 << int(QVideoFrameFormat::ColorSpace_BT601) << true;
     QTest::newRow("P010, BT.2020, limited") << int(QVideoFrameFormat::Format_P010) << 10 << 6 << int(QVideoFrameFormat::ColorSpace_BT2020) << false;
     QTest::newRow("P016, BT.709, limited") << int(QVideoFrameFormat::Format_P016) << 16 << 0 << int(QVideoFrameFormat::ColorSpace_BT709) << false;
+    // 12 bit: yuv420p12, yuv422p12, yuv444p12 and NVDEC's P012 reach the passes as P016, YUV422P16 and YUV444P16 with the code in the high 12 bits
+    QTest::newRow("12 bit in P016 (P012, yuv420p12), BT.709, limited") << int(QVideoFrameFormat::Format_P016) << 12 << 4 << int(QVideoFrameFormat::ColorSpace_BT709) << false;
+    QTest::newRow("12 bit in YUV422P16 (yuv422p12), BT.601, full") << int(QVideoFrameFormat::Format_YUV422P16) << 12 << 4 << int(QVideoFrameFormat::ColorSpace_BT601) << true;
+    QTest::newRow("12 bit in YUV444P16 (yuv444p12), BT.2020, limited") << int(QVideoFrameFormat::Format_YUV444P16) << 12 << 4 << int(QVideoFrameFormat::ColorSpace_BT2020) << false;
     QTest::newRow("YUV 4:2:2 16 bit, BT.601, full") << int(QVideoFrameFormat::Format_YUV422P16) << 16 << 0 << int(QVideoFrameFormat::ColorSpace_BT601) << true;
     QTest::newRow("YUV 4:4:4 16 bit, BT.709, limited") << int(QVideoFrameFormat::Format_YUV444P16) << 16 << 0 << int(QVideoFrameFormat::ColorSpace_BT709) << false;
 }
@@ -938,9 +942,11 @@ void tst_QQuickVideoStereo::depthOnTheGpuKeepsTheDepth()
     const int log2h = (pf == QVideoFrameFormat::Format_YUV422P16 || pf == QVideoFrameFormat::Format_YUV444P16) ? 0 : 1;
     const int w = 128, h = 64;
     const int unit = 1 << shift;
-    const int lo = bits == 10 ? 300 : 20000, step = bits == 10 ? 1 : 7;
+    // 12 bit content is held in the high bits of 16 bit words (P016 and the 16 bit planar formats: the unit is 16 words, as Qt's FFmpeg backend
+    // converts yuv420p12 and the other 12 bit formats and as NVDEC's P012 is read), a code a step as the 10 bit ramp has
+    const int lo = bits == 10 ? 300 : bits == 12 ? 1200 : 20000, step = bits == 16 ? 7 : 1;
     const int maxCode = (1 << bits) - 1;
-    const int Ucode = bits == 10 ? 517 : 33001, Vcode = bits == 10 ? 507 : 32001;
+    const int Ucode = bits == 10 ? 517 : bits == 12 ? 2059 : 33001, Vcode = bits == 10 ? 507 : bits == 12 ? 2003 : 32001;
     QVideoFrameFormat f(QSize(2 * w, h), pf);
     f.setColorSpace(QVideoFrameFormat::ColorSpace(space));
     f.setColorRange(full ? QVideoFrameFormat::ColorRange_Full : QVideoFrameFormat::ColorRange_Video);
@@ -986,7 +992,7 @@ void tst_QQuickVideoStereo::depthOnTheGpuKeepsTheDepth()
         return int(*(reinterpret_cast<const quint16 *>(fr.bits(plane) + y * fr.bytesPerLine(plane)) + x)) / unit;
     };
     // the ramp, in both views: the codes within the error of the conversion of those the C code draws, none of them lost
-    const int tolerance = bits == 10 ? 1 : 24;
+    const int tolerance = bits == 10 ? 1 : bits == 12 ? 2 : 24;
     auto run = [&](const QVideoFrame &fr, int x0, int x1, int y) {
         std::set<int> distinct;
         for (int x = x0; x < x1; ++x)
@@ -1029,7 +1035,7 @@ void tst_QQuickVideoStereo::depthOnTheGpuKeepsTheDepth()
             const int expected = (semi ? c == 0 : plane == 1) ? Ucode : Vcode;
             const int at = (cx >> log2w) * (semi ? 2 : 1) + c;
             const int g = code(gpu, plane, at, cy >> log2h), r = code(cpu, plane, at, cy >> log2h);
-            const int cTolerance = bits == 10 ? 2 : 24;
+            const int cTolerance = bits == 10 ? 2 : bits == 12 ? 4 : 24;
             QVERIFY2(std::abs(g - expected) <= cTolerance, qPrintable(u"chroma %1 of plane %2: %3, the source's %4"_s.arg(c).arg(plane).arg(g).arg(expected)));
             QVERIFY2(std::abs(g - r) <= cTolerance, qPrintable(u"chroma %1 of plane %2: %3, the C code's %4"_s.arg(c).arg(plane).arg(g).arg(r)));
         }

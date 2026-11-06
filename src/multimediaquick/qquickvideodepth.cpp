@@ -19,6 +19,7 @@
 #  include <stereo-dibr-gl.h>
 #  if QT_CONFIG(opengl)
 #    include <QtGui/qopenglcontext.h>
+#    include <QtGui/qopenglcontext_platform.h>
 #    include <rhi/qrhi.h>
 #    include <rhi/qrhi_platform.h>
 #    include <QtGui/qopenglextrafunctions.h>
@@ -629,6 +630,14 @@ public:
         std::array<GlTex, 3> plane;
         int nplanes = 0;
         unsigned generation = 0;
+        // the views as one RGB picture (RGBA8, or RGBA16 for a deeper source), the two eyes side by side, for the stereo layer's pass: the
+        // texture of plane 0 for 8 bit content, a texture of its own (rgbOwned) for a deeper one
+        GlTex rgb;
+        bool rgbOwned = false;
+        // the EGL display and context of the drawing context, when it is one, for a consumer that makes a context sharing it
+        void *eglDisplay = nullptr;
+        void *eglContext = nullptr;
+        bool es = false;
     };
 
     enum class Source { Planar, SemiUV, SemiVU, Rgba };
@@ -748,6 +757,13 @@ public:
         if (!m_context->makeCurrent(m_surface.get()))
             return fail(QStringLiteral("the OpenGL context could not be made current"), why);
         g_depthContext = m_context.get();
+        m_eglDisplay = m_eglContext = nullptr;
+#if QT_CONFIG(egl)
+        if (auto *egl = m_context->nativeInterface<QNativeInterface::QEGLContext>()) {
+            m_eglDisplay = egl->display();
+            m_eglContext = reinterpret_cast<void *>(egl->nativeContext());
+        }
+#endif
         m_f = m_context->extraFunctions();
         // 16 bit normalised textures: in the core profile always, on OpenGL ES with GL_EXT_texture_norm16
         m_deepOk = !m_context->isOpenGLES() || m_context->hasExtension(QByteArrayLiteral("GL_EXT_texture_norm16"));
@@ -792,6 +808,16 @@ public:
             m_out.erase(v.plane[i].id);
             (m_pool.size() < 8 ? m_pool : m_trash).push_back(v.plane[i]);
         }
+        if (v.rgbOwned) {
+            m_out.erase(v.rgb.id);
+            (m_pool.size() < 8 ? m_pool : m_trash).push_back(v.rgb);
+        }
+    }
+    void fillEgl(Views *views) const
+    {
+        views->eglDisplay = m_eglDisplay;
+        views->eglContext = m_eglContext;
+        views->es = m_context && m_context->isOpenGLES();
     }
     unsigned generation()
     {
@@ -1083,7 +1109,9 @@ public:
             *views = {};
             views->nplanes = 1;
             views->plane[0] = handOut(Target);
+            views->rgb = views->plane[0];
             views->generation = m_generation;
+            fillEgl(views);
             return m_f->glGetError() == 0 || (*why = QStringLiteral("the views could not be handed to the sink"), false);
         }
         // the views into the frame
@@ -1383,6 +1411,8 @@ private:
         if (views) {
             // the planes are the frame: handed out as they are, finished before the sink's context draws them
             m_f->glFinish();
+            views->rgb = handOut(Target);
+            views->rgbOwned = true;
             views->plane[0] = handOut(OutY);
             views->plane[1] = handOut(OutU);
             views->nplanes = 2;
@@ -1391,6 +1421,7 @@ private:
                 views->nplanes = 3;
             }
             views->generation = m_generation;
+            fillEgl(views);
             if (m_f->glGetError() != 0) {
                 *why = QStringLiteral("the views could not be handed to the sink");
                 return false;
@@ -1590,6 +1621,7 @@ private:
     std::set<unsigned> m_out;
     unsigned m_generation = 1;
     bool m_deepOk = true;
+    void *m_eglDisplay = nullptr, *m_eglContext = nullptr;
     Deep m_deep;
     std::unique_ptr<QRhi> m_rhi;
     bool m_rhiFailed = false;
@@ -1659,6 +1691,21 @@ public:
     }
     void unmap() override { }
     QVideoFrameFormat format() const override { return m_format; }
+    // What the stereo layer needs to draw these views itself, in a context of its own that shares the drawing context's textures
+    bool layerSource(LayerSource *out) const
+    {
+        const auto drawer = m_drawer.lock();
+        if (!drawer || m_views.generation != drawer->generation() || !m_views.rgb.id || !m_views.eglDisplay || !m_views.eglContext)
+            return false;
+        out->eglDisplay = m_views.eglDisplay;
+        out->eglContext = m_views.eglContext;
+        out->es = m_views.es;
+        out->texture = m_views.rgb.id;
+        out->width = m_views.rgb.w;
+        out->height = m_views.rgb.h;
+        out->deep = m_views.rgb.internal == GL_RGBA16_;
+        return true;
+    }
     quint64 textureHandle(QRhi &rhi, int plane) override
     {
         const auto drawer = m_drawer.lock();
@@ -1680,6 +1727,19 @@ private:
 #endif // QT_MM_DEPTH_GPU
 
 } // namespace
+
+bool layerSourceOf(const QVideoFrame &frame, LayerSource *out)
+{
+#ifdef QT_MM_DEPTH_GPU
+    QHwVideoBuffer *hw = QVideoFramePrivate::hwBuffer(frame);
+    const auto *drawn = dynamic_cast<const DrawnViewsBuffer *>(hw);
+    return drawn && drawn->layerSource(out);
+#else
+    Q_UNUSED(frame);
+    Q_UNUSED(out);
+    return false;
+#endif
+}
 
 struct Renderer::Private
 {
@@ -2124,13 +2184,20 @@ Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, M
         layerTable[0] = NAN;
     }
 
+    // The matrix of the frame: what it says, and for a frame that does not say, what Qt's own conversion assumes (HD video is BT.709, SD BT.601; the
+    // scene graph and the stereo layer's presenter convert the drawn frame with it): the views are then drawn and encoded with the matrix Qt decodes
+    // them with, and the output frame says it
+    QVideoFrameFormat::ColorSpace matrix = frame.surfaceFormat().colorSpace();
+    if (matrix == QVideoFrameFormat::ColorSpace_Undefined)
+        matrix = vh > 576 ? QVideoFrameFormat::ColorSpace_BT709 : QVideoFrameFormat::ColorSpace_BT601;
     // the output: the views at the picture's size, side by side
     QVideoFrameFormat format = frame.surfaceFormat();
+    format.setColorSpace(matrix);
     if (useGpu && !deepGpu) {
         // RGBA 8 bit, drawn by the GPU
         const QVideoFrameFormat from = format;
         format = QVideoFrameFormat(QSize(2 * vw, vh), PixelFormat::Format_RGBA8888);
-        format.setColorSpace(from.colorSpace());
+        format.setColorSpace(matrix);
         format.setColorTransfer(from.colorTransfer());
         format.setColorRange(QVideoFrameFormat::ColorRange_Full);
         format.setStreamFrameRate(from.streamFrameRate());
@@ -2211,13 +2278,7 @@ Renderer::Private::Outcome Renderer::Private::render(const QVideoFrame &input, M
             }
             if (ok)
                 ok = gpu.draw(source, deep, fullRange,
-                              frame.surfaceFormat().colorSpace()
-                                      == QVideoFrameFormat::ColorSpace_BT709
-                                      ? 1
-                                      : frame.surfaceFormat().colorSpace()
-                                              == QVideoFrameFormat::ColorSpace_BT2020
-                                              ? 2
-                                              : 0,
+                              matrix == QVideoFrameFormat::ColorSpace_BT709 ? 1 : matrix == QVideoFrameFormat::ColorSpace_BT2020 ? 2 : 0,
                               parts, depthParts, prm, table.data(), int(tableSize),
                               layerTable.empty() ? nullptr : layerTable.data(), texOut ? nullptr : &result,
                               texOut ? &views : nullptr, &reason);

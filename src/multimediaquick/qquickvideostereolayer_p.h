@@ -19,6 +19,7 @@
 #include <QtGui/qimage.h>
 #include <QtMultimedia/qvideoframeformat.h>
 #include <QtMultimediaQuick/private/qquickvideostereo_p.h>
+#include <QtMultimediaQuick/private/qquickvideodepth_p.h>
 
 #include <memory>
 
@@ -54,6 +55,18 @@ public:
     // backpressure: retry the latest matching pair when buffers are released.
     bool present(const QImage &left, const QImage &right, QQuickVideoStereo::BufferFormat format,
                  const QRect &rect);
+    // Shows the views of a frame of textures (the drawn views of a depth video) without a read back: the layer makes an EGL context that shares the
+    // drawing context's textures, a window surface for its wl_surface (the driver exchanges the buffers with the compositor as DMA-BUF where both
+    // take them), and draws the two eyes into it with one pass at the texture's depth. crop is the part of one eye shown, in the eye's pixels.
+    // False with the reason in why: the caller then shows the views through present(), which leaves the window surface. *used is the format of
+    // the surface: the one asked for where the driver has a surface of it, else the next one down (said in the log).
+    bool presentGpu(const QQuickVideoDepth::LayerSource &source, bool swapEyes, const QRect &crop,
+                    QQuickVideoStereo::BufferFormat format, const QRect &rect,
+                    QQuickVideoStereo::BufferFormat *used, QString *why);
+    // Whether the last view was shown through a window surface of the GPU
+    bool gpuActive() const;
+    // Whether the compositor offers zwp_linux_dmabuf_v1
+    bool compositorHasDmabuf() const;
     // Takes the layer off the screen until the next present()
     void hide();
 

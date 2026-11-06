@@ -4,6 +4,7 @@
 #include "qquickvideostereopresenter_p.h"
 
 #include <QtMultimedia/private/qvideoframeconverter_p.h>
+#include <QtMultimediaQuick/private/qquickvideodepth_p.h>
 #include <QtCore/qloggingcategory.h>
 #include <QtCore/qfloat16.h>
 
@@ -20,6 +21,8 @@ using Mode = QVideoFrameFormat::StereoMode;
 QQuickVideoStereoPresenter::QQuickVideoStereoPresenter(QWindow *window)
     : m_window(window)
 {
+    // the diagnostic: the views are always converted and copied into wl_shm buffers (the control of the layer's GPU path)
+    m_forceShm = qEnvironmentVariableIntValue("QT_MM_STEREO_LAYER_SHM") != 0;
     start();
     QMutexLocker lock(&m_mutex);
     while (!m_created)
@@ -55,6 +58,12 @@ void QQuickVideoStereoPresenter::clear()
     QMutexLocker lock(&m_mutex);
     m_state.clear();
     m_condition.wakeAll();
+}
+
+QQuickVideoStereoPresenter::LayerRoute QQuickVideoStereoPresenter::layerRoute() const
+{
+    QMutexLocker lock(&m_routeMutex);
+    return m_route;
 }
 
 void QQuickVideoStereoPresenter::submit(Job job)
@@ -104,6 +113,53 @@ void QQuickVideoStereoPresenter::process(State::Work work)
     const QVideoFrameFormat format = job.frame.surfaceFormat();
     const bool rightFirst = job.packing.rightEyeFirst != job.swapEyes;
     const auto depth = job.wide ? QVideoFrameImageDepth::Float32 : QVideoFrameImageDepth::Float16;
+    QString gpuWhy;
+    // The drawn views of a depth video are textures of the drawing context: the layer draws them into a window surface of the GPU, with no read back
+    // and no conversion or copy of ours (the driver and the compositor exchange the buffers, as DMA-BUF where both take them)
+    if (m_forceShm) {
+        gpuWhy = QStringLiteral("QT_MM_STEREO_LAYER_SHM asks for wl_shm buffers");
+    } else if (format.stereoFlags().testFlag(QVideoFrameFormat::StereoFlag::Multiview) || job.packing.mode != Mode::SideBySide
+               || job.packing.size != Packing::Size::Full) {
+        gpuWhy = QStringLiteral("the frame is not the full side by side the drawing passes make");
+    } else {
+        QQuickVideoDepth::LayerSource source;
+        if (!QQuickVideoDepth::layerSourceOf(job.frame, &source)) {
+            gpuWhy = QStringLiteral("the frame is not made of textures of a drawing context the layer can share");
+        } else {
+            const QSize eye(source.width / 2, source.height);
+            QRect crop(QPoint(0, 0), eye);
+            if (work.geometry.crop)
+                crop = coverCrop(eye, job.displaySize, work.geometry.destination.size());
+            if (crop.isEmpty()) {
+                gpuWhy = QStringLiteral("the crop of the views is empty");
+            } else {
+                // the revision check and the commit stay together, as for the wl_shm buffers
+                QMutexLocker lock(&m_mutex);
+                if (!m_state.isCurrent(work.revision))
+                    return;
+                m_layer->setColor({ format.colorSpace(), format.colorTransfer(), format.colorRange(), format.maxLuminance() });
+                BufferFormat used = job.format;
+                if (m_layer->presentGpu(source, rightFirst, crop, job.format, work.geometry.destination, &used, &gpuWhy)) {
+                    QMutexLocker routeLock(&m_routeMutex);
+                    ++m_route.gpuFrames;
+                    m_route.gpuActive = true;
+                    m_route.dmabuf = m_layer->compositorHasDmabuf();
+                    job.frame = {};
+                    return;
+                }
+            }
+        }
+    }
+    {
+        QMutexLocker routeLock(&m_routeMutex);
+        ++m_route.copiedFrames;
+        m_route.gpuActive = false;
+        if (m_route.why != gpuWhy)
+            qCInfo(qLcStereoPresenter).noquote() << "the views are converted and copied into wl_shm buffers by the presenter:" << gpuWhy;
+        m_route.why = gpuWhy;
+        if (m_layer)
+            m_route.dmabuf = m_layer->compositorHasDmabuf();
+    }
     QImage left, right;
     if (format.stereoFlags().testFlag(QVideoFrameFormat::StereoFlag::Multiview)) {
         left = qImageFromVideoFrameView(job.frame, rightFirst ? 1 : 0, depth);

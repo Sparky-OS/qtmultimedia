@@ -110,6 +110,20 @@ struct Q_MULTIMEDIAQUICK_EXPORT GpuMemory
     }
 };
 
+// The drawn views of a frame of textures, as one RGB texture (RGBA8, or RGBA16 normalised for a deeper source; the two eyes side by side, left
+// first, row 0 the top), and the EGL display and context of the drawing context they belong to: the stereo layer makes a context that shares it
+// and draws them into its own surface, with no read back. False for any other frame, and for views whose drawing context is gone.
+struct Q_MULTIMEDIAQUICK_EXPORT LayerSource
+{
+    void *eglDisplay = nullptr;
+    void *eglContext = nullptr;
+    bool es = false;
+    unsigned texture = 0;
+    int width = 0, height = 0;
+    bool deep = false;
+};
+Q_MULTIMEDIAQUICK_EXPORT bool layerSourceOf(const QVideoFrame &frame, LayerSource *out);
+
 class Q_MULTIMEDIAQUICK_EXPORT Renderer
 {
 public:

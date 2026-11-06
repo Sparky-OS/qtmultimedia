@@ -151,6 +151,18 @@ public:
     void submit(Job job);
     void hide();
 
+    // How the views reached the layer: frames of textures drawn by the layer into a window surface of the GPU (no read back, no copy of ours),
+    // and frames converted and copied into wl_shm buffers (with the reason of the last one that was not drawn by the GPU)
+    struct LayerRoute
+    {
+        int gpuFrames = 0;
+        int copiedFrames = 0;
+        QString why;
+        bool dmabuf = false;   // the compositor offers zwp_linux_dmabuf_v1
+        bool gpuActive = false; // the last frame was drawn by the GPU
+    };
+    LayerRoute layerRoute() const;
+
 private:
     // The thread makes the layer, shows into it, and lets it go: the library that declares the
     // stereo content keeps its state per thread
@@ -165,6 +177,9 @@ private:
     bool m_stopping = false;
     bool m_created = false;
     bool m_valid = false;
+    mutable QMutex m_routeMutex;
+    LayerRoute m_route;
+    bool m_forceShm = false;
 };
 
 QT_END_NAMESPACE
