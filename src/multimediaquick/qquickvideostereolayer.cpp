@@ -344,6 +344,13 @@ struct GlApi
     }
 };
 
+// how many frames are skipped before the dump (QT_MM_STEREO_LAYER_DUMP_SKIP, default 3)
+int dumpSkipFrames()
+{
+    static const int skip = qEnvironmentVariableIsSet("QT_MM_STEREO_LAYER_DUMP_SKIP") ? qEnvironmentVariableIntValue("QT_MM_STEREO_LAYER_DUMP_SKIP") : 3;
+    return skip;
+}
+
 // The window surface formats a display has, as "r.g.b.a" (with f for floating point), for the message of a refusal
 QString windowFormatsOf(EGLDisplay display)
 {
@@ -790,7 +797,7 @@ bool QQuickVideoStereoLayer::present(const QImage &left, const QImage &right, Bu
     writePair(left, right, format, buffer->data, pixels.width() * bytesPerPixel(format));
     // the diagnostic of the proofs, as for the GPU path: the buffer as the compositor gets it
     static const QByteArray dumpDir = qgetenv("QT_MM_STEREO_LAYER_DUMP");
-    if (!dumpDir.isEmpty() && ++d->frames > 3 && d->shmDumped < 6) {
+    if (!dumpDir.isEmpty() && ++d->frames > dumpSkipFrames() && d->shmDumped < 6) {
         const QString base = QString::fromLocal8Bit(dumpDir) + QStringLiteral("/shm-%1").arg(d->shmDumped++);
         QFile out(base + QStringLiteral(".raw"));
         if (out.open(QIODevice::WriteOnly))
@@ -949,7 +956,7 @@ bool QQuickVideoStereoLayer::presentGpu(const QQuickVideoDepth::LayerSource &sou
     // A diagnostic for the proofs: the first frames of the surface read back as the surface holds them (RGBA8, RGB10_A2, RGBA half float), into
     // QT_MM_STEREO_LAYER_DUMP
     static const QByteArray dumpDir = qgetenv("QT_MM_STEREO_LAYER_DUMP");
-    if (!dumpDir.isEmpty() && ++d->frames > 3 && g.dumped < 6) {
+    if (!dumpDir.isEmpty() && ++d->frames > dumpSkipFrames() && g.dumped < 6) {
         const bool tenBit = g.format == BufferFormat::Xrgb2101010, half = g.format == BufferFormat::Xbgr16161616f;
         const int bytes = half ? 8 : 4;
         QByteArray pixelsBack(pixels.width() * pixels.height() * bytes, 0);

@@ -187,8 +187,11 @@ static bool submittedDepthViews(int count, int width, int destination, int *left
     }
     const auto entry = QJsonDocument::fromJson(lines.last()).object();
     const auto target = entry.value("destination").toArray();
+    // a wl_shm buffer (XRGB8888, rows from the top) or what the layer's window surface of the GPU holds at the swap (RGBA, rows from the bottom, as the
+    // recorder reads it back): the same views either way
+    const bool gpuSurface = entry.value("format").toString() == u"rgba-bottom-up"_s;
     if (entry.value("width").toInt() != width || entry.value("height").toInt() != 90
-            || entry.value("format").toInt() != 1 || entry.value("content").toInt() != 3
+            || (!gpuSurface && entry.value("format").toInt() != 1) || entry.value("content").toInt() != 3
             || target.size() != 2 || target[0].toInt() != destination || target[1].toInt() != 120) {
         qWarning() << "Submitted buffer is" << entry;
         return false;
@@ -204,8 +207,10 @@ static bool submittedDepthViews(int count, int width, int destination, int *left
     const int x0 = (160 - viewWidth) / 2;
     const int border = 8;
     for (int eye = 0; eye < 2; ++eye) {
+        // channel 0 is the blue, 1 the green, 2 the red (the bytes of XRGB8888; RGBA are the other way round)
         auto sample = [&](int x, int y, int channel) {
-            return reinterpret_cast<const uchar *>(bytes.constData())[y * stride + (eye * viewWidth + x) * 4 + channel];
+            const int row = gpuSurface ? 89 - y : y;
+            return reinterpret_cast<const uchar *>(bytes.constData())[row * stride + (eye * viewWidth + x) * 4 + (gpuSurface ? 2 - channel : channel)];
         };
         const int shift = sample(viewWidth / 2, 45, 2) - (x0 + viewWidth / 2);
         for (int y = 0; y < 90; ++y) {
