@@ -1921,18 +1921,21 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
         result.video = twoViews && !baseOnly;
         result.packing = packing.mode == StereoMode::None ? StereoNone
                                                           : inputFromPacking(packing, frameSize);
+        result.shownPacking = result.packing;
         if (!twoViews)
             result.sequence = 0;
 
 #ifdef QT_MM_STEREO_LAYER
         if (!repeated) {
             QMutexLocker lock(&m_frameMutex);
-            auto previous = m_stereoLastFrame.surfaceFormat();
+            // the format and the packing of the frame shown before, as they were compared then: for a depth video the frame kept to show again is the
+            // stored one (the picture with its depth map) and the frame shown the drawn views, so the stored one is no measure of what changed
+            auto previous = m_stereoLastShownFormat;
             auto incoming = format;
             previous.setStereoView(QVideoFrameFormat::StereoView::Packed);
             incoming.setStereoView(QVideoFrameFormat::StereoView::Packed);
             if (m_stereoLastFrame.isValid()
-                    && (previous != incoming || result.packing != st.packing)) {
+                    && (previous != incoming || result.shownPacking != st.shownPacking)) {
                 ++m_stereoSourceSerial;
                 m_stereoPair.reset();
                 m_stereoHeldFrame = {};
@@ -2143,6 +2146,7 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
         eyeChanged = m_stereo.eyeRect != result.eyeRect;
         m_stereo.video = result.video;
         m_stereo.packing = result.packing;
+        m_stereo.shownPacking = result.shownPacking;
         m_stereo.layerWanted = result.layerWanted;
 #ifdef QT_MM_STEREO_LAYER
         if (!twoViews || (baseOnly && st.input == StereoNone)) {
@@ -2164,10 +2168,13 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
         m_stereo.lastView = result.lastView;
         m_stereo.viewVaries = result.viewVaries;
         // the frame is kept, to be shown again when the choices change, only for 3D video
-        if (twoViews || depthInput != StereoNone)
+        if (twoViews || depthInput != StereoNone) {
             m_stereoLastFrame = frame;
-        else
+            m_stereoLastShownFormat = input.isValid() ? input.surfaceFormat() : frame.surfaceFormat();
+        } else {
             m_stereoLastFrame = QVideoFrame();
+            m_stereoLastShownFormat = {};
+        }
         if (skip)
             return;
 

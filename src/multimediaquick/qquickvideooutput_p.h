@@ -429,6 +429,8 @@ private:
         // what the video in hand is
         bool video = false;                // two views in the frames
         StereoInput packing = StereoNone;  // as the stream or the input says (never Automatic)
+        // the packing of the frame as it is shown (a depth video: the full side by side of its drawn views, where packing says the depth layout)
+        StereoInput shownPacking = StereoNone;
         bool layerWanted = false;          // shown through the layer, if there is one
         bool layerActive = false;
         bool cropGeometrySupported = false;
@@ -439,6 +441,7 @@ private:
     };
     StereoState m_stereo;
     QVideoFrame m_stereoLastFrame;          // to show again when the choices change
+    QVideoFrameFormat m_stereoLastShownFormat; // the format of the frame as it was shown (a depth video: of the drawn views)
     // draws the views of a picture with its depth map (libstereo-dibr), from the threads of the
     // video and of the item in turn
     mutable QMutex m_depthMutex;
