@@ -1396,6 +1396,18 @@ bool QQuickVideoOutput::stereoLayerSupported()
     Whether the video is shown through the layer: both views, each to its eye. The item itself
     is then a transparent hole in the window over the layer.
 */
+QQuickVideoOutput::StereoSurface QQuickVideoOutput::stereoSurfaceFor(StereoSurface chosen, int sourceDepth)
+{
+    return chosen != StereoSurfaceBySource ? chosen
+            : sourceDepth <= 8 ? StereoSurface8Bit : sourceDepth <= 10 ? StereoSurface10Bit : StereoSurfaceHalfFloat;
+}
+
+quint64 QQuickVideoOutput::stereoSourceSerial() const
+{
+    QMutexLocker lock(&m_frameMutex);
+    return m_stereoSourceSerial;
+}
+
 bool QQuickVideoOutput::stereoLayerActive() const
 {
     QMutexLocker lock(&m_frameMutex);
@@ -2023,8 +2035,7 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
             job.scaling = st.scaling == StereoLanczos ? Scaling::Lanczos
                     : st.scaling == StereoBicubic ? Scaling::Bicubic : Scaling::Bilinear;
             const int depth = sourceDepth(format.pixelFormat());
-            const StereoSurface surface = st.surface != StereoSurfaceBySource ? st.surface
-                    : depth <= 8 ? StereoSurface8Bit : depth <= 10 ? StereoSurface10Bit : StereoSurface16Bit;
+            const StereoSurface surface = stereoSurfaceFor(st.surface, depth);
             job.format = surface == StereoSurface8Bit ? BufferFormat::Xrgb8888
                     : surface == StereoSurface10Bit ? BufferFormat::Xrgb2101010
                     : surface == StereoSurface16Bit ? BufferFormat::Xbgr16161616

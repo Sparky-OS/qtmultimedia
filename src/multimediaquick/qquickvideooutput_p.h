@@ -289,6 +289,10 @@ public:
     StereoInput stereoPacking() const;
     static bool stereoLayerSupported();
     bool stereoLayerActive() const;
+    // the surface the views are drawn into for a video of this depth in bits (the person's choice, or the depth of the video for StereoSurfaceBySource)
+    static StereoSurface stereoSurfaceFor(StereoSurface chosen, int sourceDepth);
+    // how many times the source of the views changed (the presenter is cleared each time)
+    quint64 stereoSourceSerial() const;
     bool stereoDepth() const;
     void setStereoDepth(bool value);
     StereoDepthView stereoDepthView() const;

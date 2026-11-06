@@ -100,6 +100,8 @@ private slots:
     void depthDeepCases_data();
     void depthDeepCases();
     void depthInVideoOutput();
+    void surfaceBySourceDepth_data();
+    void surfaceBySourceDepth();
     void depthViewsReachTheSinkAsTextures_data();
     void depthViewsReachTheSinkAsTextures();
     void depthTextureFramesConvertLikeTheCopies_data();
@@ -1501,6 +1503,31 @@ void tst_QQuickVideoStereo::depthDeepCases()
     gpu.unmap();
     cpu.unmap();
     qunsetenv("XDG_CACHE_HOME");
+}
+
+// The surface the views are drawn into follows the depth of the video: 8 bits, 10 bits, and above 10 bits (12 bit video too, half float holds about
+// 11 significant bits) 16 bits unsigned normalised; the person's own choice is kept as it is
+void tst_QQuickVideoStereo::surfaceBySourceDepth_data()
+{
+    using Surface = QQuickVideoOutput::StereoSurface;
+    QTest::addColumn<int>("chosen");
+    QTest::addColumn<int>("depth");
+    QTest::addColumn<int>("expected");
+    const int bySource = QQuickVideoOutput::StereoSurfaceBySource;
+    QTest::newRow("8 bit") << bySource << 8 << int(Surface::StereoSurface8Bit);
+    QTest::newRow("10 bit") << bySource << 10 << int(Surface::StereoSurface10Bit);
+    QTest::newRow("12 bit") << bySource << 12 << int(Surface::StereoSurface16Bit);
+    QTest::newRow("16 bit") << bySource << 16 << int(Surface::StereoSurface16Bit);
+    QTest::newRow("chosen 8 bit on 16 bit video") << int(Surface::StereoSurface8Bit) << 16 << int(Surface::StereoSurface8Bit);
+    QTest::newRow("chosen half float on 12 bit video") << int(Surface::StereoSurfaceHalfFloat) << 12 << int(Surface::StereoSurfaceHalfFloat);
+}
+
+void tst_QQuickVideoStereo::surfaceBySourceDepth()
+{
+    QFETCH(int, chosen);
+    QFETCH(int, depth);
+    QFETCH(int, expected);
+    QCOMPARE(int(QQuickVideoOutput::stereoSurfaceFor(QQuickVideoOutput::StereoSurface(chosen), depth)), expected);
 }
 
 void tst_QQuickVideoStereo::depthInVideoOutput()
