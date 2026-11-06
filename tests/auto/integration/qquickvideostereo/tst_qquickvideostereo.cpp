@@ -102,6 +102,7 @@ private slots:
     void depthInVideoOutput();
     void surfaceBySourceDepth_data();
     void surfaceBySourceDepth();
+    void depthVideoDoesNotClearThePresenter();
     void depthViewsReachTheSinkAsTextures_data();
     void depthViewsReachTheSinkAsTextures();
     void depthTextureFramesConvertLikeTheCopies_data();
@@ -1528,6 +1529,31 @@ void tst_QQuickVideoStereo::surfaceBySourceDepth()
     QFETCH(int, depth);
     QFETCH(int, expected);
     QCOMPARE(int(QQuickVideoOutput::stereoSurfaceFor(QQuickVideoOutput::StereoSurface(chosen), depth)), expected);
+}
+
+// A depth video is drawn into views: the frame kept to show again is the stored one (the picture with its depth map) and the frame shown the drawn
+// views. The source of the views must not count as changed at every frame (the presenter is cleared, and the conversion of a slow wl_shm presentation
+// is dropped as out of date, each time it does)
+void tst_QQuickVideoStereo::depthVideoDoesNotClearThePresenter()
+{
+    if (!QQuickVideoDepth::canDraw())
+        QSKIP("built without libstereo-dibr");
+    QQuickVideoOutput output;
+    QVideoSink *sink = output.videoSink();
+    const int w = 240, h = 136;
+    sink->setVideoFrame(depthFrame(Mode::DepthSideBySide, false, w, h));
+    QTRY_COMPARE(output.stereoPacking(), QQuickVideoOutput::StereoDepthSideBySide);
+    // let the first frames settle (the first drawn views may be a change of the source)
+    for (int i = 0; i < 4; ++i) {
+        sink->setVideoFrame(depthFrame(Mode::DepthSideBySide, false, w, h));
+        QTest::qWait(60);
+    }
+    const quint64 settled = output.stereoSourceSerial();
+    for (int i = 0; i < 12; ++i) {
+        sink->setVideoFrame(depthFrame(Mode::DepthSideBySide, false, w, h));
+        QTest::qWait(30);
+    }
+    QCOMPARE(output.stereoSourceSerial(), settled);
 }
 
 void tst_QQuickVideoStereo::depthInVideoOutput()
