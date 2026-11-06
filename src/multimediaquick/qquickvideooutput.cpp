@@ -1944,12 +1944,12 @@ void QQuickVideoOutput::setFrame(const QVideoFrame &frame, bool repeated)
             QMutexLocker lock(&m_frameMutex);
             // the format of the frame shown before, as it was compared then: for a depth video the frame kept to show again is the stored one
             // (the picture with its depth map) and the frame shown the drawn views, so the stored one is no measure of what changed
-            auto previous = m_stereoLastFrame.surfaceFormat();
+            auto previous = m_stereoLastShownFormat;
             auto incoming = format;
             previous.setStereoView(QVideoFrameFormat::StereoView::Packed);
             incoming.setStereoView(QVideoFrameFormat::StereoView::Packed);
             if (m_stereoLastFrame.isValid()
-                    && (previous != incoming || result.packing != st.packing)) {
+                    && (previous != incoming || result.shownPacking != st.shownPacking)) {
                 ++m_stereoSourceSerial;
                 m_stereoPair.reset();
                 m_stereoHeldFrame = {};
